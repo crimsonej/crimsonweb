@@ -1,0 +1,64 @@
+# ═══════════════════════════════════════════════════════════════════
+#  CRIMSON WEB — Proxy Pool Configuration
+#  Format: protocol://[user:pass@]host:port
+#  Supported: socks5, socks4, http, https
+# ═══════════════════════════════════════════════════════════════════
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  HOW TO GET FREE PROXIES FOR BUG BOUNTY                       │
+# ├─────────────────────────────────────────────────────────────────┤
+# │                                                                 │
+# │  OPTION 1 — Tor (Best for free, anonymous scanning)            │
+# │    Install:  sudo apt install tor                              │
+# │    Start:    sudo systemctl start tor                          │
+# │    Proxy:    socks5://127.0.0.1:9050                           │
+# │    Note:     Slow but free + anonymous. Great for recon.       │
+# │                                                                 │
+# │  OPTION 2 — Proxychains + Tor (multiple circuits)             │
+# │    Install:  sudo apt install proxychains4 tor                 │
+# │    Crimson Web auto-detects proxychains4 if installed.          │
+# │                                                                 │
+# │  OPTION 3 — Free SOCKS5 proxy lists (rotate frequently)       │
+# │    Sources:                                                     │
+# │      https://www.proxy-list.download/SOCKS5                   │
+# │      https://raw.githubusercontent.com/TheSpeedX/             │
+# │        PROXY-List/master/socks5.txt                            │
+# │      https://raw.githubusercontent.com/monosans/              │
+# │        proxy-list/main/proxies/socks5.txt                      │
+# │    Fetch fresh list:                                            │
+# │      curl -sL [URL_ABOVE] > proxies.txt                       │
+# │                                                                 │
+# │  OPTION 4 — Free HTTP proxy lists                              │
+# │    Sources:                                                     │
+# │      https://raw.githubusercontent.com/TheSpeedX/             │
+# │        PROXY-List/master/http.txt                              │
+# │      https://raw.githubusercontent.com/monosans/              │
+# │        proxy-list/main/proxies/http.txt                        │
+# │                                                                 │
+# │  OPTION 5 — Chisel / SSH SOCKS tunnel (your own VPS)          │
+# │    ssh -D 9050 -q -N user@your-vps-ip                         │
+# │    Proxy:    socks5://127.0.0.1:9050                           │
+# │    Note:     Best performance. $5/mo VPS = unlimited proxy.   │
+# │                                                                 │
+# │  ⚠  IMPORTANT NOTES:                                           │
+# │    - Free public proxies die fast. Refresh before each scan.   │
+# │    - Crimson Web validates proxies at boot (check_proxy).       │
+# │    - Dead proxies are skipped automatically.                   │
+# │    - Go tools need format: http://ip:port or socks5://ip:port │
+# │    - DO NOT use proxies for illegal activity.                  │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# ── YOUR PROXIES BELOW (one per line) ─────────────────────────────
+# Uncomment and edit the lines below, or paste your proxy list.
+#
+# Tor local proxy (install tor first: sudo apt install tor)
+socks5://127.0.0.1:9050
+#
+# SSH SOCKS tunnel (ssh -D 1080 user@vps)
+socks5://127.0.0.1:1080
+#
+# Free public proxies (replace with fresh ones before each scan)
+# socks5://IP:PORT
+# http://IP:PORT
+socks5://127.0.0.1:9050
+
