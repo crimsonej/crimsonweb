@@ -43,7 +43,7 @@ Essential Tools: httpx, nuclei, amass, katana, naabu, ffuf.
 2. Quick Start
 Bash
 ￼
-git clone https://github.com/youruser/crimsonweb.git
+git clone https://github.com/crimsonej/crimsonweb.git
 cd crimsonweb
 chmod +x setup.sh crimsonweb.sh
 ./setup.sh
