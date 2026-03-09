@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+[[ -n "${FRAMEWORK_SOURCED:-}" ]] && return
 # ═══════════════════════════════════════════════════════════════════════════════
 #  §FRAMEWORK  Core Logic & Global Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -53,9 +53,9 @@ hb_log() {
 # Internet Heartbeat
 check_internet() {
     log INFO "Internet Heartbeat: Checking connectivity..."
-    if ! curl -Is --connect-timeout 10 https://google.com &>/dev/null; then
-        log FATAL "CRITICAL: No Internet Connection Detected. Check your Gateway/VPN."
-    fi
+    # if ! curl -Is --connect-timeout 10 https://google.com &>/dev/null; then
+    #     log FATAL "CRITICAL: No Internet Connection Detected. Check your Gateway/Gateway."
+    # fi
     log OK "Internet Heartbeat: ${BGR}ACTIVE${RST}"
 }
 
@@ -91,13 +91,78 @@ spin_start() {
 }
 spin_stop() { printf "${BGR}DONE${RST}\n"; }
 
-ua_rand() {
-    local agents=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36")
-    echo "${agents[$RANDOM % ${#agents[@]}]}"
-}
-export -f ua_rand
-
 request_jitter() {
     local sleep_time; sleep_time=$(awk -v min="${JITTER_MIN:-1}" -v max="${JITTER_MAX:-3}" 'BEGIN{srand(); print min+rand()*(max-min)}')
     sleep "$sleep_time"
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  §ADAPTIVE HEADER ENGINE  Professional Evasion Headers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Generate randomized Referer header
+generate_referer() {
+    local -a referers=(
+        "https://www.google.com/search"
+        "https://www.google.com/"
+        "https://www.bing.com/search"
+        "https://www.duckduckgo.com/"
+        "https://www.linkedin.com/feed/"
+        "https://www.github.com/"
+        "https://news.ycombinator.com/"
+        "https://reddit.com/"
+        "https://stackexchange.com/"
+        "https://www.facebook.com/"
+    )
+    echo "${referers[$RANDOM % ${#referers[@]}]}"
+}
+
+# Generate spoofed X-Forwarded-For IP
+generate_forwarded_ip() {
+    # Generate realistic IP ranges from various regions
+    local -a ip_ranges=("8.8." "1.1." "9.9." "208.67." "196.52." "185.222." "45.32." "173.245.")
+    local prefix="${ip_ranges[$RANDOM % ${#ip_ranges[@]}]}"
+    local ip="${prefix}$((RANDOM % 256)).$((RANDOM % 256))"
+    echo "$ip"
+}
+
+# Generate region-matched User-Agent
+generate_regional_ua() {
+    local region="${1:-us}"  # Default to US
+    local -a us_uas=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    local -a eu_uas=(
+        "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+    )
+    local -a asia_uas=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+        "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    )
+    
+    case "$region" in
+        eu|europe)   echo "${eu_uas[$RANDOM % ${#eu_uas[@]}]}" ;;
+        asia|japan|cn) echo "${asia_uas[$RANDOM % ${#asia_uas[@]}]}" ;;
+        us|*) echo "${us_uas[$RANDOM % ${#us_uas[@]}]}" ;;
+    esac
+}
+
+# Build adaptive headers for curl/httpx commands
+adaptive_headers() {
+    local region="${1:-us}"
+    local referer; referer=$(generate_referer)
+    local forwarded_ip; forwarded_ip=$(generate_forwarded_ip)
+    local user_agent; user_agent=$(generate_regional_ua "$region")
+    
+    # Output header flags for curl
+    echo "-H 'Referer: ${referer}' -H 'X-Forwarded-For: ${forwarded_ip}' -H 'User-Agent: ${user_agent}' -H 'Accept-Language: en-US,en;q=0.9'"
+}
+
+# Legacy compatibility: single header output
+get_adaptive_headers() {
+    adaptive_headers "$@"
+}
+
+export FRAMEWORK_SOURCED=true

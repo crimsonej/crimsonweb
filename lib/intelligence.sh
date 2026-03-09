@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+[[ -n "${INTELLIGENCE_SOURCED:-}" ]] && return
+export INTELLIGENCE_SOURCED=true
 # ═══════════════════════════════════════════════════════════════════════════════
 #  §INTELLIGENCE  Initialization & Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -32,7 +33,21 @@ init_settings() {
 init_vault() {
     TARGET_SAFE="${TARGET//[^a-zA-Z0-9._-]/_}"
     TARGET_DIR="${VAULT_ROOT}/${TARGET_SAFE}"
-    mkdir -p "${TARGET_DIR}/logs" "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used"
+    
+    # §FIX: Centralized Mandatory Directory Initialization
+    echo -e "[*] Preparing target vault: ${BWHT}${TARGET_DIR}${RST}"
+    mkdir -p "${TARGET_DIR}/logs" 
+    mkdir -p "${TARGET_DIR}/websites" 
+    mkdir -p "${TARGET_DIR}/tools_used"
+    mkdir -p "${TARGET_DIR}/raw"
+    mkdir -p "${TARGET_DIR}/vulnerabilities"
+    mkdir -p "${TARGET_DIR}/vulns"
+    mkdir -p "${TARGET_DIR}/screenshots"
+    mkdir -p "${TARGET_DIR}/HIGH_ALERTS"
+    mkdir -p "${TARGET_DIR}/filtered"
+    touch "${TARGET_DIR}/RECON_results.txt"
+    touch "${TARGET_DIR}/logs/session.log"
+
     log OK "Vault Initialized: ${WH}${TARGET_DIR}${RST}"
 }
 
@@ -49,7 +64,7 @@ session_init() {
 # Post-flight setup
 cmd_setup() {
     log INFO "Verifying binary arsenal..."
-    local tools=(bc stdbuf pkill pgrep curl jq)
+    local tools=(bc stdbuf pkill pgrep curl jq anew)
     for t in "${tools[@]}"; do
         if ! tool_exists "$t"; then
             log ERROR "Missing system dependency: ${WH}${t}${RST}"
@@ -59,11 +74,46 @@ cmd_setup() {
 
 # Interactive Target Prompt
 prompt_target() {
-    printf "  ${BCR}●${RST} ${BWHT}TARGET DOMAIN${RST} (e.g. example.com): "
-    read -r TARGET
-    if [[ -z "$TARGET" ]]; then
-        log FATAL "Target domain cannot be empty."
-    fi
+    # CRITICAL: Operator has total control over target input - no timeouts
+    # Domain validation regex: accepts domains AND IPs
+    local DOMAIN_REGEX='^([a-zA-Z0-9]{1,63}\.)+[a-zA-Z]{2,63}$|^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+    # Loop until a valid TARGET is set (either local or via C2)
+    while [[ -z "$TARGET" ]]; do
+        # Check if remote target was set via Telegram /target command
+        if [[ -f /tmp/crimson_answer ]]; then
+            TARGET=$(cat /tmp/crimson_answer)
+            rm -f /tmp/crimson_answer
+            TARGET=$(echo "$TARGET" | sed -e 's|^[^/]*://||' -e 's|/.*$||')
+            if [[ "$TARGET" =~ $DOMAIN_REGEX ]]; then
+                printf "  🕷️  ENTER TARGET DOMAIN (e.g., example.com) > %s (remote)\n" "$TARGET"
+                log OK "Target accepted from remote: ${WH}${TARGET}${RST}"
+                break
+            else
+                log WARN "Remote target had invalid format: ${TARGET}. Ignoring."
+                TARGET=""
+                continue
+            fi
+        fi
+
+        # Prompt local operator (blocking, no timers)
+        read -r -p "  ● TARGET DOMAIN: " TARGET
+        TARGET=$(echo "$TARGET" | sed -e 's|^[^/]*://||' -e 's|/.*$||')
+
+        if [[ -z "$TARGET" ]]; then
+            printf "  ${BCR}[ERROR]${RST} Input cannot be empty. Try again.\n"
+            TARGET=""
+            continue
+        fi
+
+        if [[ "$TARGET" =~ $DOMAIN_REGEX ]]; then
+            log OK "Target accepted: ${WH}${TARGET}${RST}"
+            break
+        else
+            printf "  ${BCR}[ERROR]${RST} Invalid format. Enter domain (example.com), subdomain (api.example.com), or IP (1.2.3.4)\n"
+            TARGET=""
+        fi
+    done
 }
 
 # High Alert Keywords
@@ -79,7 +129,326 @@ init_high_alert_keywords() {
     export HIGH_INTEREST_KEYWORDS
 }
 
-phase_should_run() { true; } 
+phase_should_run() {
+    local phase="$1"
+    # If TARGET_DIR not set, default to running the phase
+    [[ -z "${TARGET_DIR:-}" ]] && return 0
+    local marker_file="${TARGET_DIR}/.phase_${phase}.done"
+    if [[ -f "$marker_file" ]]; then
+        # Phase already completed
+        return 1
+    fi
+    return 0
+}
+
 phase_complete() {
-    log OK "Phase $1 Complete."
+    local phase="$1"
+    log OK "Phase $phase Complete."
+    if [[ -n "${TARGET_DIR:-}" ]]; then
+        touch "${TARGET_DIR}/.phase_${phase}.done"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  §BOOTSTRAP  Universal Linux Environment Detection & Tool Sync
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Detect Linux distribution
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        local name; name=$(grep ^NAME= /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+        echo "${name,,}"
+    else
+        echo "unknown"
+    fi
+}
+
+# Map distro to package manager
+get_package_manager() {
+    local distro="$1"
+    case "$distro" in
+        ubuntu|debian|parrot|kali|mint|raspbian) echo "apt" ;;
+        arch|manjaro) echo "pacman" ;;
+        fedora|rhel|centos|rocky|almalinux) echo "dnf" ;;
+        opensuse|opensuse-leap|opensuse-tumbleweed) echo "zypper" ;;
+        alpine) echo "apk" ;;
+        *) echo "apt" ;; # Default fallback
+    esac
+}
+
+# Detect OS version info
+get_os_info() {
+    if [[ -f /etc/os-release ]]; then
+        local pretty; pretty=$(grep ^PRETTY_NAME= /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+        if [[ -n "$pretty" ]]; then
+            echo "$pretty"
+        else
+            uname -s -r
+        fi
+    else
+        uname -s -r
+    fi
+}
+
+# Get system hardware specs
+get_hardware_specs() {
+    local cpu_cores; cpu_cores=$(nproc 2>/dev/null || echo "1")
+    local total_ram; total_ram=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || echo "Unknown")
+    local distro; distro=$(detect_distro)
+    local os_info; os_info=$(get_os_info)
+    
+    echo "CPU_CORES=$cpu_cores"
+    echo "TOTAL_RAM=$total_ram"
+    echo "DISTRO=$distro"
+    echo "OS_INFO=$os_info"
+}
+
+# Install core system dependencies
+install_core_tools() {
+    local distro="$1"
+    local pm; pm=$(get_package_manager "$distro")
+    local tools=("jq" "curl" "git" "bc")
+    
+    log INFO "Installing system dependencies via ${WH}${pm}${RST}..."
+    
+    case "$pm" in
+        apt)
+            sudo apt-get update -qq >/dev/null 2>&1
+            for tool in "${tools[@]}"; do
+                if ! command -v "$tool" &>/dev/null; then
+                    log INFO "Installing ${WH}${tool}${RST}..."
+                    sudo apt-get install -y "$tool" >/dev/null 2>&1 && log OK "${tool}" || log WARN "Failed to install ${tool}"
+                fi
+            done
+            ;;
+        pacman)
+            for tool in "${tools[@]}"; do
+                if ! command -v "$tool" &>/dev/null; then
+                    log INFO "Installing ${WH}${tool}${RST}..."
+                    sudo pacman -Sy --noconfirm "$tool" >/dev/null 2>&1 && log OK "${tool}" || log WARN "Failed to install ${tool}"
+                fi
+            done
+            ;;
+        dnf)
+            for tool in "${tools[@]}"; do
+                if ! command -v "$tool" &>/dev/null; then
+                    log INFO "Installing ${WH}${tool}${RST}..."
+                    sudo dnf install -y "$tool" >/dev/null 2>&1 && log OK "${tool}" || log WARN "Failed to install ${tool}"
+                fi
+            done
+            ;;
+        zypper)
+            sudo zypper refresh >/dev/null 2>&1
+            for tool in "${tools[@]}"; do
+                if ! command -v "$tool" &>/dev/null; then
+                    log INFO "Installing ${WH}${tool}${RST}..."
+                    sudo zypper install -y "$tool" >/dev/null 2>&1 && log OK "${tool}" || log WARN "Failed to install ${tool}"
+                fi
+            done
+            ;;
+        apk)
+            for tool in "${tools[@]}"; do
+                if ! command -v "$tool" &>/dev/null; then
+                    log INFO "Installing ${WH}${tool}${RST}..."
+                    sudo apk add "$tool" >/dev/null 2>&1 && log OK "${tool}" || log WARN "Failed to install ${tool}"
+                fi
+            done
+            ;;
+    esac
+}
+
+# Install Go (if missing)
+install_golang() {
+    if command -v go &>/dev/null; then
+        log OK "Go is already installed"
+        return 0
+    fi
+    
+    log INFO "Go not found. Attempting installation..."
+    
+    local os_type; os_type=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local arch; arch=$(uname -m)
+    local go_ver="1.22.0"
+    
+    case "$arch" in
+        x86_64) arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+    esac
+    
+    local go_url="https://go.dev/dl/go${go_ver}.${os_type}-${arch}.tar.gz"
+    
+    log INFO "Downloading Go from ${WH}${go_url}${RST}..."
+    if curl -fsSL "$go_url" -o /tmp/go.tar.gz 2>/dev/null; then
+        sudo rm -rf /usr/local/go 2>/dev/null || true
+        sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm -f /tmp/go.tar.gz
+        
+        # Update PATH for current session
+        export PATH="/usr/local/go/bin:$PATH"
+        mkdir -p "${HOME}/go/bin"
+        export PATH="${HOME}/go/bin:$PATH"
+        
+        log OK "Go installed successfully"
+        return 0
+    else
+        log WARN "Failed to download Go"
+        return 1
+    fi
+}
+
+# Sync Go-based security tools
+sync_security_tools() {
+    local force_bg="${1:-false}"
+    
+    log INFO "Synchronizing Go-based security tools..."
+    
+    # Ensure Go PATH is set
+    export GOPATH="${HOME}/go"
+    export PATH="${GOPATH}/bin:/usr/local/go/bin:$PATH"
+    
+    # Map of tool → go install package
+    declare -A GO_TOOLS=(
+        ["nuclei"]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+        ["subfinder"]="github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+        ["anew"]="github.com/tomnomnom/anew@latest"
+        ["ghauri"]="github.com/r0oth3x0r/ghauri@latest"
+        ["arjun"]="github.com/s0md3v/arjun@latest"
+        ["cloudkiller"]="github.com/hakluke/cloudkiller@latest"
+    )
+    
+    # Helper function for synchronizing tools
+    _sync_tools_impl() {
+        for tool in "${!GO_TOOLS[@]}"; do
+            if ! command -v "$tool" &>/dev/null; then
+                log INFO "Installing ${WH}${tool}${RST} via go install..."
+                if go install "${GO_TOOLS[$tool]}" 2>/dev/null; then
+                    log OK "${tool} installed"
+                    # Ensure tool is in local bin
+                    if [[ -f "${GOPATH}/bin/${tool}" ]]; then
+                        chmod +x "${GOPATH}/bin/${tool}"
+                    fi
+                else
+                    log WARN "Failed to install ${tool}"
+                fi
+            fi
+        done
+    }
+    
+    if [[ "$force_bg" == "true" ]]; then
+        # Run in background with nohup; redirect output to sync log to keep terminal clean
+        local sync_log="/tmp/crimson_sync.log"
+        nohup bash -c "
+            export GOPATH='${GOPATH}'; export PATH='${PATH}'; \
+            declare -A GO_TOOLS=( \
+                ['nuclei']='github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest' \
+                ['subfinder']='github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest' \
+                ['anew']='github.com/tomnomnom/anew@latest' \
+                ['ghauri']='github.com/r0oth3x0r/ghauri@latest' \
+                ['arjun']='github.com/s0md3v/arjun@latest' \
+                ['cloudkiller']='github.com/hakluke/cloudkiller@latest' \
+            ); \
+            for tool in "\${!GO_TOOLS[@]}"; do \
+                [[ ! \$(command -v \$tool 2>/dev/null) ]] && go install "\${GO_TOOLS[\$tool]}" 2>>"${sync_log}" && chmod +x \${GOPATH}/bin/\$tool 2>>"${sync_log}" || true; \
+            done
+        " >"${sync_log}" 2>&1 &
+        local sync_pid=$!
+        register_pid $! 2>/dev/null || true
+        log OK "Tool sync started in background (PID: ${WH}${sync_pid}${RST}); logs: ${WH}${sync_log}${RST}"
+    else
+        _sync_tools_impl
+    fi
+}
+
+# Lazy-load tool before phase execution
+lazy_install_tool() {
+    local tool="$1"
+    
+    if command -v "$tool" &>/dev/null; then
+        return 0
+    fi
+    
+    log WARN "${WH}${tool}${RST} not found. Attempting just-in-time installation..."
+    
+    export GOPATH="${HOME}/go"
+    export PATH="${GOPATH}/bin:/usr/local/go/bin:$PATH"
+    
+    declare -A TOOL_PACKAGES=(
+        ["nuclei"]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+        ["subfinder"]="github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+        ["anew"]="github.com/tomnomnom/anew@latest"
+        ["ghauri"]="github.com/r0oth3x0r/ghauri@latest"
+        ["arjun"]="github.com/s0md3v/arjun@latest"
+        ["cloudkiller"]="github.com/hakluke/cloudkiller@latest"
+    )
+    
+    if [[ -n "${TOOL_PACKAGES[$tool]:-}" ]]; then
+        if go install "${TOOL_PACKAGES[$tool]}" 2>/dev/null; then
+            log OK "${tool} installed just-in-time"
+            export PATH="${GOPATH}/bin:$PATH"
+            return 0
+        fi
+    fi
+    
+    log ERROR "Could not install ${tool}. Phase may fail."
+    return 1
+}
+
+# Universal environment bootstrap
+bootstrap_env() {
+    local distro; distro=$(detect_distro)
+    
+    log PHASE "🔧 Universal Bootstrap: Initializing ${WH}${distro}${RST} environment..."
+    
+    # Check if sudo is available and necessary
+    local needs_sudo=false
+    if [[ "$(whoami)" != "root" ]] && ! sudo -n true 2>/dev/null; then
+        log WARN "This system may require ${WH}sudo${RST} for package installation"
+        log WARN "Run with ${WH}sudo${RST} or configure passwordless sudo for better experience"
+        needs_sudo=true
+    fi
+    
+    # Install core dependencies
+    install_core_tools "$distro"
+    
+    # Install or verify Go
+    if ! command -v go &>/dev/null; then
+        if [[ "$needs_sudo" == "true" ]]; then
+            log WARN "Go not installed and sudo required. Skipping Go installation."
+            log INFO "Install manually: ${WH}sudo apt-get install golang-go${RST} (or equivalent)"
+        else
+            install_golang
+        fi
+    else
+        log OK "Go environment ready"
+    fi
+    
+    # Sync Go tools (background mode for non-blocking startup)
+    sync_security_tools "true"
+    
+    log OK "Bootstrap complete. Tools syncing in background..."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  §SYSTEM AUDIT: Enhanced startup verification and auto-provisioning
+# ═══════════════════════════════════════════════════════════════════════════════
+
+bootstrap_system() {
+    local distro; distro=$(detect_distro)
+    local pm; pm=$(get_package_manager "$distro")
+    
+    log PHASE "🔧 OS-AWARE BOOTSTRAP: Detecting environment and provisioning tools..."
+    log PHASE "Detected: ${WH}${distro}${RST} | Package Manager: ${WH}${pm}${RST}"
+    
+    # Start environment bootstrap in background (tool sync will log to /tmp/crimson_sync.log)
+    bootstrap_env > /tmp/crimson_sync.log 2>&1 &
+    local bootstrap_pid=$!
+    # Register background PID for cleanup tracking
+    [[ -n "${bootstrap_pid}" ]] && register_pid "${bootstrap_pid}" 2>/dev/null || true
+    
+    # Important: Do NOT wait for bootstrap - framework proceeds immediately
+    # Bootstrap and tool installation continue silently in the background
+    # This enables operator to start targeting while tools still install
+    log OK "System provisioning running in background (PID: ${WH}${bootstrap_pid}${RST}); sync log: /tmp/crimson_sync.log"
+    log OK "Framework ready for targeting while tools sync..."
+    return 0
 }

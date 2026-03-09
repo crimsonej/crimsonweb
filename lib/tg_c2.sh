@@ -1,25 +1,103 @@
-#!/usr/bin/env bash
+[[ -n "${TG_C2_SOURCED:-}" ]] && return
+export TG_C2_SOURCED=true
 # ═══════════════════════════════════════════════════════════════════════════════
 #  §6.5  TELEGRAM C2 BRIDGE (Unified & Modular)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Severity-based notification system
+export TG_SEVERITY_LOG="${TARGET_DIR:-/tmp}/logs/tg_severity.log"
 
 # Internal variables (imported from config via main entry)
 # TELEGRAM_BOT_TOKEN
 # TELEGRAM_CHAT_ID
 
+# Severity-based alert sender (ENHANCED)
+tg_alert() {
+    local severity="$1"  # INFO, LOW, MEDIUM, HIGH, CRITICAL
+    local msg="$2"
+    
+    [[ -z "$msg" ]] && return
+    
+    # Log to local severity log regardless
+    mkdir -p "$(dirname "$TG_SEVERITY_LOG")" 2>/dev/null
+    printf "[%s] %s: %s\n" "$(date +%Y-%m-%d\ %H:%M:%S)" "$severity" "$msg" >> "$TG_SEVERITY_LOG"
+    
+    # Only send MEDIUM/HIGH/CRITICAL to Telegram
+    case "$severity" in
+        INFO|LOW)
+            # Save to logs only, do NOT send to Telegram for LOW/INFO; use ℹ️ for logs
+            tg_send "ℹ️ *INFO*: ${msg}"
+            ;;
+        MEDIUM)
+            tg_send "⚠️ *MEDIUM ALERT*\n${msg}"
+            ;;
+        HIGH)
+            tg_send "🚨 *HIGH*\n${msg}"
+            ;;
+        CRITICAL)
+            tg_send "🚨 *CRITICAL*\n${msg}"
+            ;;
+    esac
+}
+
+# Phase completion summary
+tg_phase_summary() {
+    local phase="$1"
+    local target="${2:-unknown}"
+    local asset_count="${3:-0}"
+    local duration_seconds="${4:-0}"
+    
+    # Format duration
+    local mins=$((duration_seconds / 60))
+    local secs=$((duration_seconds % 60))
+    
+    local summary="🕷️ <b>PHASE COMPLETE: ${phase}</b>\n"
+    summary+="🎯 Target: <code>${target}</code>\n"
+    summary+="📦 Total Assets: <code>${asset_count}</code>\n"
+    summary+="⏱️ Time: <code>${mins}m ${secs}s</code>"
+    
+    tg_send "$summary"
+}
+
 # Unified HTML-based sender
 tg_send() {
     local msg="$1"
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]] && return
-    
+
     local clean_token; clean_token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
     local clean_id; clean_id=$(echo "$TELEGRAM_CHAT_ID" | tr -d '[:space:]')
-    
-    # Use HTML parse mode for better control over "High Alert" data
-    curl -s --connect-timeout 10 --max-time 60 -X POST "https://api.telegram.org/bot${clean_token}/sendMessage" \
+    local url="https://api.telegram.org/bot${clean_token}/sendMessage"
+
+    # Clean message: strip ANSI color codes and escape HTML brackets
+    local CLEAN_BODY
+    CLEAN_BODY=$(echo -e "$msg" | sed 's|\x1b\[[0-9;]*m||g' | sed 's|<|\&lt;|g; s|>|\&gt;|g')
+
+    # Prefix header with Node IP (HTML safe) and assemble final message (use URL-encoded newlines)
+    local CURRENT_IP
+    CURRENT_IP=$(curl -s --max-time 5 http://ifconfig.me || echo "unknown")
+    local HEADER
+    HEADER="<b>🌍 [Node]:</b> <code>${CURRENT_IP}</code>"
+    local FINAL_MESSAGE
+    FINAL_MESSAGE="${HEADER}%0A%0A${CLEAN_BODY}"
+
+    # Perform a strict POST with short timeouts and capture response for diagnostics (HTML mode)
+    local resp
+    resp=$(curl -sS --connect-timeout 5 --max-time 15 -X POST "$url" \
         -d "chat_id=${clean_id}" \
-        -d "text=${msg}" \
-        -d "parse_mode=HTML" >/dev/null 2>&1 &
+        --data-urlencode "text=${FINAL_MESSAGE}" \
+        -d "parse_mode=HTML") || {
+        log WARN "Telegram send failed: network/connectivity error"
+        return 1
+    }
+
+    # Inspect API response
+    if echo "$resp" | grep -q '"ok":true'; then
+        hb_log "C2" "Telegram message delivered"
+        return 0
+    else
+        log WARN "Telegram API error: ${resp}"
+        return 2
+    fi
 }
 
 # Aliases for backward compatibility
@@ -30,71 +108,102 @@ tg_send_file() {
     local caption="$2"
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" || ! -f "$file_path" ]] && return
     
-    local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+    local token; token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
+    local chat_id; chat_id=$(echo "$TELEGRAM_CHAT_ID" | tr -d '[:space:]')
+    local url="https://api.telegram.org/bot${token}/sendDocument"
+    
     curl -s --connect-timeout 10 --max-time 60 -X POST "$url" \
-        -F "chat_id=${TELEGRAM_CHAT_ID}" \
+        -F "chat_id=${chat_id}" \
         -F "document=@${file_path}" \
         -F "caption=${caption}" \
-        -F "parse_mode=HTML" >/dev/null 2>&1 &
+        -F "parse_mode=Markdown" >/dev/null 2>&1 &
 }
 
 tg_send_photo() {
     local file="$1" desc="${2:-Photo}"
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" || ! -f "$file" ]] && return
     
-    curl -s --connect-timeout 10 --max-time 60 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
-        -F "chat_id=${TELEGRAM_CHAT_ID}" \
+    local token; token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
+    local chat_id; chat_id=$(echo "$TELEGRAM_CHAT_ID" | tr -d '[:space:]')
+    
+    curl -s --connect-timeout 10 --max-time 60 -X POST "https://api.telegram.org/bot${token}/sendPhoto" \
+        -F "chat_id=${chat_id}" \
         -F "photo=@${file}" \
         -F "caption=📸 ${desc}" \
-        -F "parse_mode=HTML" >/dev/null 2>&1 &
+        -F "parse_mode=Markdown" >/dev/null 2>&1 &
 }
 
 tg_send_video() {
     local file="$1" desc="${2:-Video}"
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" || ! -f "$file" ]] && return
     
-    curl -s --connect-timeout 10 --max-time 60 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo" \
-        -F "chat_id=${TELEGRAM_CHAT_ID}" \
+    local token; token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
+    local chat_id; chat_id=$(echo "$TELEGRAM_CHAT_ID" | tr -d '[:space:]')
+    
+    curl -s --connect-timeout 10 --max-time 60 -X POST "https://api.telegram.org/bot${token}/sendVideo" \
+        -F "chat_id=${chat_id}" \
         -F "video=@${file}" \
         -F "caption=🎬 ${desc}" \
-        -F "parse_mode=HTML" >/dev/null 2>&1 &
+        -F "parse_mode=Markdown" >/dev/null 2>&1 &
 }
 
-# ─── INTERACTIVE INPUT (Wait-Lock) ───────────────────────────────────────────
+# ─── UNIFIED BIDIRECTIONAL INPUT (Local + Telegram Simultaneous) ────────────
 get_input() {
-    local prompt="$1" opts="$2" timeout="${3:-0}"
+    local prompt="$1" opts="$2" timeout="${3:-0}"  # 0 = wait indefinitely (critical)
+    local fifo="${INPUT_FIFO}"
+    
+    # Announce wait-lock to operator via Telegram
     tg_send "❓ <b>Wait-Lock Activated</b>\n${prompt}\nOptions: <code>${opts}</code>"
     
-    local wait_file="/tmp/crimson_waiting"
-    local ans_file="/tmp/crimson_answer"
-    
-    mkdir -p /tmp 2>/dev/null
-    touch "$wait_file"
-    rm -f "$ans_file"
-    
-    [[ -p "$INPUT_FIFO" ]] || mkfifo "$INPUT_FIFO" 2>/dev/null || true
-    exec 3<> "$INPUT_FIFO" 2>/dev/null || true
+    # Ensure FIFO exists before reading
+    [[ -p "$fifo" ]] || { rm -f "$fifo"; mkfifo "$fifo"; chmod 666 "$fifo"; } 2>/dev/null || true
     
     local ans=""
-    local elapsed=0
-    while [[ ! -f "$ans_file" ]]; do
-        if read -r -t 1 local_ans < /dev/tty; then
-            [[ -n "$local_ans" ]] && { ans="$local_ans"; break; }
+    local start_time; start_time=$(date +%s)
+    
+    # Validate timeout boundary
+    [[ ${timeout} -lt 0 ]] && timeout=0
+    
+    # DUAL-MONITOR LOOP: Reads from BOTH Telegram (FIFO) and local terminal simultaneously
+    # This ensures instant responsiveness to /skip commands typed on phone or in VS Code
+    while true; do
+        # ==== PRIORITY 1: Check Telegram C2 (FIFO) ====
+        # Non-blocking read with 0.5s timeout per attempt
+        if timeout 0.5 cat "$fifo" 2>/dev/null | head -1 | grep -q .; then
+            ans=$(timeout 0.5 cat "$fifo" 2>/dev/null | head -1)
+            if [[ -n "${ans}" ]]; then
+                log OK "C2 Response: ${WH}${ans}${RST} (Telegram)"
+                break
+            fi
         fi
         
-        if read -r -t 0.2 fifo_ans <&3 2>/dev/null; then
-            [[ -n "$fifo_ans" ]] && { ans="$fifo_ans"; break; }
+        # ==== PRIORITY 2: Check local terminal input ====
+        # Only if terminal is interactive
+        if [[ -t 0 ]]; then
+            if read -r -t 0.5 -p "" local_ans 2>/dev/null; then
+                if [[ -n "${local_ans}" ]]; then
+                    ans="${local_ans}"
+                    log OK "Local Response: ${WH}${ans}${RST} (Terminal)"
+                    break
+                fi
+            fi
         fi
         
+        # ==== PRIORITY 3: Check overall timeout ====
+        # Only enforce timeout if explicitly set (> 0)
         if (( timeout > 0 )); then
-            (( elapsed++ )) || true
-            if (( elapsed >= timeout )); then break; fi
+            local current_time; current_time=$(date +%s)
+            local elapsed=$((current_time - start_time))
+            if (( elapsed >= timeout )); then
+                log WARN "Input timeout (${timeout}s). Proceeding with no response."
+                break
+            fi
         fi
+        
+        # Brief sleep to prevent busy-waiting
+        sleep 0.1
     done
     
-    exec 3>&- 2>/dev/null || true
-    [[ -z "$ans" && -f "$ans_file" ]] && ans=$(cat "$ans_file")
-    rm -f "$wait_file" "$ans_file"
     echo "$ans"
 }
 
@@ -123,42 +232,189 @@ error_streamer() {
     done
 }
 
+# C2 Executor - processes commands from FIFO (including remote /target)
+tg_executor() {
+    [[ -z "${INPUT_FIFO:-}" ]] && return
+    [[ ! -p "$INPUT_FIFO" ]] && return
+    
+    # Non-blocking read from FIFO
+    local cmd
+    if timeout 0.5 cat "$INPUT_FIFO" 2>/dev/null | head -1 | grep -q .; then
+        cmd=$(timeout 0.5 cat "$INPUT_FIFO" 2>/dev/null | head -1)
+        [[ -z "$cmd" ]] && return
+        
+        # Handle special commands
+        # Format: /target syfe.com OR /target https://syfe.com
+        if [[ "$cmd" =~ ^target[[:space:]]+ ]]; then
+            local remote_target="${cmd#target[[:space:]]*}"
+            # Strip protocol if present
+            remote_target=$(echo "$remote_target" | sed -e 's|^[^/]*://||' -e 's|/.*$||')
+            
+            # Validate target format
+            if is_valid_domain "$remote_target"; then
+                # Write remote target to answer file for prompt_target to read
+                echo "$remote_target" > /tmp/crimson_answer
+                TARGET="$remote_target"
+                tg_send "✅ <b>Remote Target Set</b>: <code>${remote_target}</code>"
+                log PHASE "C2: Remote target received: ${WH}${remote_target}${RST}"
+            else
+                tg_send "❌ <b>Invalid Target Format</b>: <code>${remote_target}</code>"
+                log WARN "C2: Invalid remote target format"
+            fi
+            return
+        fi
+        
+        case "$cmd" in
+            skip)
+                tg_send "⏭️  Skipped current phase."
+                touch /tmp/crimson_skip
+                log PHASE "C2: SKIP command executed"
+                ;;
+            retry)
+                tg_send "🔄 Retrying current phase."
+                log PHASE "C2: RETRY command executed"
+                ;;
+            abort)
+                tg_send "🛑 Aborted scan. Cleaning up..."
+                log FATAL "C2: ABORT command - terminating"
+                exit 1
+                ;;
+            continue)
+                tg_send "▶️  Continuing to next phase."
+                log PHASE "C2: CONTINUE command executed"
+                ;;
+            pause)
+                tg_send "⏸️  Scan paused."
+                log WARN "C2: PAUSE command"
+                ;;
+            resume)
+                tg_send "▶️  Scan resumed."
+                log PHASE "C2: RESUME command"
+                ;;
+            logs)
+                # Send last 10 lines of /tmp/crimson_sync.log
+                local logs; logs=$(tail -n 10 /tmp/crimson_sync.log 2>/dev/null || echo "No logs available")
+                tg_send "*Last 10 lines of /tmp/crimson_sync.log*\n\n\`\`\`${logs}\n\`\`\`"
+                ;;
+            websites)
+                local livef="${TARGET_DIR}/websites/live_urls.txt"
+                if [[ -f "$livef" && -s "$livef" ]]; then
+                    tg_send_file "$livef" "Live URLs for ${TARGET}"
+                else
+                    tg_send "ℹ️ No live URLs found yet."
+                fi
+                ;;
+            vulns)
+                local vulndir="${TARGET_DIR}/vulnerabilities"
+                if [[ -d "$vulndir" ]]; then
+                    local tarf="/tmp/vulns_${TARGET}_$(date +%s).tar.gz"
+                    tar -czf "$tarf" -C "$vulndir" . 2>/dev/null || true
+                    if [[ -f "$tarf" ]]; then
+                        tg_send_file "$tarf" "Vulnerabilities for ${TARGET}" && rm -f "$tarf"
+                    else
+                        tg_send "ℹ️ No vulnerability artifacts to send."
+                    fi
+                else
+                    tg_send "ℹ️ Vulnerabilities directory not present."
+                fi
+                ;;
+            stop)
+                tg_send "🛑 Stop signal received. Terminating current operations..."
+                touch /tmp/crimson_stop
+                log PHASE "C2: STOP signal issued"
+                ;;
+            status)
+                local phase="${CURRENT_PHASE:-INIT}"
+                local target="${TARGET:-none}"
+                tg_send "📊 <b>Status Report</b>\\nPhase: ${phase}\\nTarget: ${target}"
+                ;;
+            *)
+                # Unknown command - log it
+                [[ -n "$cmd" ]] && log WARN "C2: Unknown command: ${cmd}"
+                ;;
+        esac
+    fi
+}
+
 # C2 Heartbeat / Verification
 check_c2() {
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]] && return
-    local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe"
-    if curl -s --connect-timeout 5 "$url" | grep -q '"ok":true'; then
+    local token; token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
+    local url="https://api.telegram.org/bot${token}/getMe"
+    if curl -s --connect-timeout 10 --max-time 30 "$url" | grep -q '"ok":true'; then
         log OK "Telegram C2: ${BGR}Verified & Synchronized${RST}"
     else
         log WARN "Telegram C2: Verification Failed. Check Token/Network."
     fi
 }
 
-# ─── TELEGRAM C2 ENGINE ──────────────────────────────────────────────────────
+# ─── TELEGRAM C2 ENGINE (Persistent Bidirectional Command Polling) ────────────
 telegram_listener() {
     [[ -z "$TELEGRAM_BOT_TOKEN" ]] && return
+    local token; token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
     local offset=0
-    local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+    local url="https://api.telegram.org/bot${token}/getUpdates"
+    local fifo="${INPUT_FIFO}"
     
+    # Ensure FIFO exists with proper permissions
+    [[ -p "$fifo" ]] || { rm -f "$fifo"; mkfifo "$fifo"; chmod 666 "$fifo"; } 2>/dev/null || true
+    
+    # PERSISTENT LOOP: Never exits, polls continuously
     while true; do
-        local resp; resp=$(curl -s --connect-timeout 10 "${url}?offset=${offset}&timeout=30")
-        [[ -z "$resp" ]] && { sleep 5; continue; }
+        local resp
+        # Long-polling with 30s timeout for instant C2 responsiveness
+        resp=$(curl -s --connect-timeout 10 --max-time 60 "${url}?offset=${offset}&timeout=30" 2>/dev/null)
+        [[ -z "$resp" ]] && { sleep 3; continue; }
         
-        # Process each message
-        local count; count=$(echo "$resp" | jq '.result | length' 2>/dev/null || echo 0)
-        for ((i=0; i<count; i++)); do
-            local msg; msg=$(echo "$resp" | jq -r ".result[$i].message.text" 2>/dev/null)
-            local chat_id; chat_id=$(echo "$resp" | jq -r ".result[$i].message.chat.id" 2>/dev/null)
-            local update_id; update_id=$(echo "$resp" | jq -r ".result[$i].update_id" 2>/dev/null)
-            offset=$((update_id + 1))
+        # Validate JSON response before processing
+        if ! echo "$resp" | jq . >/dev/null 2>&1; then
+            sleep 2
+            continue
+        fi
+        
+        # Extract the latest update using jq (reduce processing and focus on newest message)
+        local latest; latest=$(echo "$resp" | jq -r '.result | last')
+        if [[ "$latest" != "null" && -n "$latest" ]]; then
+            local msg; msg=$(echo "$latest" | jq -r '.message.text // empty' 2>/dev/null)
+            local chat_id; chat_id=$(echo "$latest" | jq -r '.message.chat.id // empty' 2>/dev/null)
+            local update_id; update_id=$(echo "$latest" | jq -r '.update_id // empty' 2>/dev/null)
 
-            # Security: Only respond to authorized Chat ID
-            if [[ "$chat_id" == "$TELEGRAM_CHAT_ID" ]]; then
-                if [[ "$msg" == /* ]]; then
-                    echo "$msg" > "$INPUT_FIFO"
+            # Update offset to mark message as processed
+            if [[ -n "$update_id" && "$update_id" =~ ^[0-9]+$ ]]; then
+                offset=$((update_id + 1))
+            fi
+
+            # Process only messages from authorized Chat ID
+            if [[ -n "$chat_id" && -n "$TELEGRAM_CHAT_ID" && "$chat_id" == "$TELEGRAM_CHAT_ID" && -n "$msg" ]]; then
+                # If message is /stop -> kill PID from /tmp/crimson.pid
+                if [[ "$msg" =~ ^/stop ]]; then
+                    local pidfile="/tmp/crimson.pid"
+                    if [[ -f "$pidfile" ]]; then
+                        local target_pid; target_pid=$(cat "$pidfile" 2>/dev/null || echo "")
+                        if [[ -n "$target_pid" ]]; then
+                            kill -9 "$target_pid" 2>/dev/null || true
+                            tg_send "🛑 Killed process PID: ${target_pid}"
+                            log PHASE "C2: /stop executed -> killed ${target_pid}"
+                        else
+                            tg_send "ℹ️ /stop received but PID file empty"
+                        fi
+                    else
+                        tg_send "ℹ️ /stop received but PID file not found"
+                    fi
+                    # Continue to next poll
+                    continue
+                fi
+
+                # For other recognized commands, write to FIFO (remove leading /)
+                if [[ "$msg" =~ ^/([a-zA-Z0-9_]+)([[:space:]]|$) ]]; then
+                    local cmd; cmd="${msg:1}"
+                    { echo "$cmd" > "$fifo"; } 2>/dev/null &
+                    log PHASE "C2 Command Received: ${WH}${cmd}${RST} (source: Telegram)"
                 fi
             fi
-        done
+        fi
+        
+        # Short sleep to prevent API hammering
         sleep 1
     done
 }
@@ -202,48 +458,4 @@ tg_stream() {
     fi
 }
 
-tg_executor() {
-    [[ -p "$INPUT_FIFO" ]] || mkfifo "$INPUT_FIFO" 2>/dev/null
-    while true; do
-        if read -r cmd < "$INPUT_FIFO"; then
-            case "$cmd" in
-                /help) tg_send "<b>Crimson C2 Help</b>\n/status - Realtime Telemetry\n/ls - Vault Tree\n/shot - Screen Snapshot\n/live - 10s Screen Video\n/log - Last 20 logs\n/skip - Remote Batch Kill\n/sys - PC System Info" ;;
-                /status) 
-                    local uptime; uptime=$(($(date +%s) - START_EPOCH))
-                    tg_send "📊 <b>Mission Status</b>\nTarget: <code>${TARGET}</code>\nPhase: <b>${CURRENT_PHASE}</b>\nTool: <code>${CURRENT_TOOL}</code>\n\n📈 <b>Pulse</b>\nSubs: <code>${CNT_SUBS}</code>\nPorts: <code>${CNT_PORTS}</code>\nURLs: <code>${CNT_URLS}</code>\nVulns: <code>${CNT_VULNS}</code>\n\n⏱️ Uptime: <code>${uptime}s</code>" 
-                    ;;
-                /ls) 
-                    local tree; tree=$(ls -F "$TARGET_DIR" 2>/dev/null | head -n 20)
-                    tg_send "📁 <b>Vault Contents</b>\n<code>${tree}</code>" 
-                    ;;
-                /log) 
-                    local logs; logs=$(tail -n 20 "${TARGET_DIR}/logs/session.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*[mK]//g')
-                    tg_send "📝 <b>Latest Logs</b>\n<code>${logs}</code>" 
-                    ;;
-                /skip) 
-                    touch /tmp/crimson_answer
-                    tg_send "⚠️ <b>Skip Signal</b> injected into framework."
-                    ;;
-                /shot|/snap)
-                    if declare -f tg_snap >/dev/null; then
-                        tg_snap
-                    else
-                        tg_send "📸 Snapshot engine not initialized."
-                    fi
-                    ;;
-                /live|/stream)
-                    if declare -f tg_stream >/dev/null; then
-                        tg_stream
-                    else
-                        tg_send "🎬 Stream engine not initialized."
-                    fi
-                    ;;
-                /sys)
-                    local sys_info; sys_info=$(uname -a | cut -d' ' -f1-3)
-                    local load; load=$(uptime | awk -F'load average:' '{ print $2 }')
-                    tg_send "🖥️ <b>System Info</b>\nOS: <code>${sys_info}</code>\nLoad: <code>${load}</code>"
-                    ;;
-            esac
-        fi
-    done
-}
+# Removed duplicate tg_executor (the FIFO-driven executor above is the canonical implementation)

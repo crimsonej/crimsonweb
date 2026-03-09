@@ -11,8 +11,15 @@ process_high_alert_links() {
     local temp_urls="${TARGET_DIR}/tools_used/high_alert_temp.txt"
     local temp_filtered="${TARGET_DIR}/tools_used/high_alert_filtered.txt"
     
+    # Guard against unset variables when running under set -u
+    [[ -z "${TARGET_DIR:-}" ]] && return
+    [[ -z "${HIGH_INTEREST_KEYWORDS:-}" ]] && return
+
     mkdir -p "$alert_dir"
     touch "$history_file" "$hits_file"
+
+    # §FIX: Early return if input is missing or empty
+    [[ ! -s "$input_file" ]] && return
 
     log INFO "High Alert Pipeline: Scanning for sensitive endpoints..."
 
@@ -31,13 +38,24 @@ process_high_alert_links() {
     if tool_exists httpx && tool_exists nuclei; then
         local px; px=$(proxy_prefix)
         local pf; pf=$(proxy_flag)
+        local ua; ua=$(ua_rand)
+        local HTTPX_BIN="$(command -v httpx || echo httpx)"
         local nuclei_out="${alert_dir}/.temp_nuclei_alerts.txt"
         
         spin_start "Scanning ${match_count} targets for active secrets..."
         mkdir -p "$alert_dir"
-        ${px} ~/go/bin/httpx -list "$temp_filtered" -status-code -mc 200 -silent -threads 50 ${pf:+-http-proxy '${pf}'} \
-        | awk '{print $1}' \
-        | ${px} xargs -I {} -P 50 nuclei -u "{}" -t exposures/ -t tokens/ -silent -o "${nuclei_out}" ${pf:+-proxy '${pf}'} >/dev/null 2>&1
+        # §FIX: Ensure all URLs have protocol prefix before httpx processing
+        local httpx_raw="${alert_dir}/httpx_high_alert.log"
+        local urls_with_protocol="${alert_dir}/.temp_urls_with_protocol.txt"
+        sed -E 's|^([^/])|http://\1|; s|^http://http|http|; s|^http://https|https|' "$temp_filtered" > "$urls_with_protocol"
+        # Preferred high-alert httpx flags: -silent -sc -title -cl -ct -location -fc 403
+        run_live "cat '$urls_with_protocol' | xargs -I {} ${px} ${HTTPX_BIN} -header \"User-Agent: ${ua}\" -silent -sc -title -cl -ct -location -fc 403 -rl 30 -t 10 {}" "$httpx_raw" "HIGH-ALERT-HTTPX"
+        grep -v "\[HIGH-ALERT-HTTPX\]" "$httpx_raw" | awk 'NF>1 {print $1}' > "${alert_dir}/.temp_targets.txt" || true
+        
+        if [[ -s "${alert_dir}/.temp_targets.txt" ]]; then
+            # Ensure nuclei templates are updated and template path provided
+            run_live "${px} nuclei -ut -t /root/nuclei-templates/ -l '${alert_dir}/.temp_targets.txt' -t exposures/ -t tokens/ -silent -o '${nuclei_out}' ${pf:+-proxy '${pf}'}" "${alert_dir}/nuclei_high_alert.log" "HIGH-ALERT-NUCLEI"
+        fi
         spin_stop
         
         if [[ -s "$nuclei_out" ]]; then

@@ -12,13 +12,11 @@ source "$LIB_PATH/tg_c2.sh"
 source "$(dirname "$LIB_PATH")/core/high_alert.sh"
 
 phase_recon() {
-    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/vulnerabilities" "${TARGET_DIR}/filtered"
-    if [[ ! -d "$TARGET_DIR" ]]; then
-        log FATAL "Vault setup failed. Directory not found: ${WH}${TARGET_DIR}${RST}"
-        exit 1
+    if [[ "${FORCE_RECON:-0}" -eq 1 ]]; then
+        log INFO "FORCE_RECON=1 — Forcing RECON phase despite resume state."
+    else
+        phase_should_run "RECON" || { log SKIP "RECON — already completed (session resume)."; return; }
     fi
-
-    phase_should_run "RECON" || { log SKIP "RECON — already completed (session resume)."; return; }
     CURRENT_PHASE="RECON"
     print_phase_map; print_loot
 
@@ -52,6 +50,14 @@ phase_recon() {
     touch "$all" "$hist"
 
     log INFO "Launching parallel reconnaissance engine (MAX_JOBS=${MAX_JOBS:-3})..."
+    hud_event "+" "User-Agent Rotation: ACTIVE | Adaptive Rate Limiting: ${ADAPTIVE_DELAY}s delay"
+    
+    # ─── LAZY LOADING: Attempt just-in-time installation of missing tools ───
+    for recon_tool in subfinder assetfinder amass; do
+        if ! tool_exists "$recon_tool"; then
+            lazy_install_tool "$recon_tool" || log WARN "Skipping ${recon_tool} (not available)"
+        fi
+    done
     
     # Launch tools in background and register PIDs
     if tool_exists subfinder; then
@@ -59,49 +65,84 @@ phase_recon() {
         check_c2
         run_live "${px} subfinder -d '${TARGET}' -silent -t 150 -all -recursive -o '${raw}/subfinder.txt'" "${raw}/subfinder.log" "SUBFINDER" &
         register_batch_pid $!
+        rate_limit  # Apply adaptive delay
     fi
 
     if tool_exists assetfinder; then
         job_limiter
-        run_live "${px} assetfinder --subs-only '${TARGET}' | tee '${raw}/assetfinder.txt'" "${raw}/assetfinder.log" "ASSETFINDER" &
+        run_live "${px} assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
         register_batch_pid $!
+        rate_limit
     fi
 
     if tool_exists amass; then
+        local total_ram; total_ram=$(free -m | awk '/^Mem:/{print $2}')
+        local avail_ram; avail_ram=$(free -m | awk '/^Mem:/{print $7}')
+        [[ -z "$avail_ram" ]] && avail_ram=$(free -m | awk '/^Mem:/{print $4+$6}')
+        
+        local amass_flags="-passive -timeout 10"
+        
         check_resources "amass"
         job_limiter
         mkdir -p "$raw"
         local amass_dir="/tmp/amass_session_$$"
         mkdir -p "$amass_dir"
-        run_live "${px} amass enum -passive -d '${TARGET}' -timeout 30 -dir '${amass_dir}' -o '${raw}/amass.txt'" "${raw}/amass.log" "AMASS" &
+        run_live "${px} amass enum $amass_flags -d '${TARGET}' -dir '${amass_dir}' -o '${raw}/amass.txt'" "${raw}/amass.log" "AMASS" &
         register_batch_pid $!
+        rate_limit
     fi
 
     if tool_exists gau; then
         job_limiter
         check_c2
-        run_live "${px} gau --subs --threads ${THREADS:-50} --timeout 30 --providers wayback,commoncrawl,otx '${TARGET}' | tee '${raw}/gau.txt'" "${raw}/gau.log" "GAU" &
+        run_live "${px} gau --subs --threads ${THREADS:-50} --timeout 30 --providers wayback,commoncrawl,otx '${TARGET}'" "${raw}/gau.log" "GAU" &
         register_batch_pid $!
         # §FIX: Immediate High Alert Trigger
-        process_high_alert_links "${raw}/gau.txt" &
+        process_high_alert_links "${raw}/gau.log" &
         register_pid $!
     fi
 
     if tool_exists waybackurls; then
         job_limiter
-        run_live "echo '${TARGET}' | ${px} waybackurls | tee '${raw}/wayback.txt'" "${raw}/wayback.log" "WAYBACK" &
+        run_live "echo '${TARGET}' | ${px} waybackurls" "${raw}/wayback.log" "WAYBACK" &
         register_batch_pid $!
         # §FIX: Immediate High Alert Trigger
-        process_high_alert_links "${raw}/wayback.txt" &
+        process_high_alert_links "${raw}/wayback.log" &
         register_pid $!
     fi
     
     monitor_jobs "RECON"
     
+    # §FIX: Sort Safety
+    [[ -s "${raw}/gau.log" ]] && sort -u "${raw}/gau.log" -o "${raw}/gau.log"
+    [[ -s "${raw}/wayback.log" ]] && sort -u "${raw}/wayback.log" -o "${raw}/wayback.log"
+    
     log INFO "Consolidating results into Master Target List..."
-    cat "${raw}/subfinder.txt" "${raw}/assetfinder.txt" "${raw}/amass.txt" 2>/dev/null \
-        | grep -v '*' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-        | sort -u | anew "$all" > "${rd}/new_assets.txt"
+    hud_event "*" "Consolidating subdomain results with intelligent deduplication..."
+
+    # Stream inputs directly to avoid large in-memory variables
+    {
+        cat "${raw}/subfinder.txt" "${raw}/assetfinder.log" "${raw}/amass.txt" 2>/dev/null || true
+    } | grep -v '*' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u > "${rd}/new_assets.txt"
+
+    if tool_exists anew; then
+        # Use anew if available for smart deduplication
+        cat "${rd}/new_assets.txt" | anew "$all" > "${rd}/new_assets_added.txt" 2>/dev/null || {
+            # Fallback if anew fails
+            cat "${rd}/new_assets.txt" > "${rd}/new_assets.txt" 
+            cat "${rd}/new_assets.txt" >> "$all"
+            sort -u -o "$all" "$all"
+        }
+    else
+        # §ENHANCED: Robust fallback without anew - ensure proper newline handling
+        {
+            cat "$all" 2>/dev/null || true
+            cat "${rd}/new_assets.txt"
+        } | sort -u > "${all}.tmp"
+        mv "${all}.tmp" "$all"
+
+        hud_event "+" "Anew tool missing, used safe fallback deduplication ($(wc -l < "$all") unique entries)"
+    fi
     
     # Update History
     cat "$all" >> "$hist"
@@ -109,6 +150,7 @@ phase_recon() {
     
     CNT_SUBS=$(wc -l < "$all" 2>/dev/null || echo 0)
     hb_log "RECON" "Recon Complete: ${BGR}${CNT_SUBS} unique subdomains${RST} in the vault."
+    hud_event "+" "Subdomains discovered: ${CNT_SUBS}"
     
     # Handshake for Phase 2
     cp "$all" "${TARGET_DIR}/RECON_results.txt"
