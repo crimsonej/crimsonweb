@@ -207,10 +207,19 @@ refresh_proxies() {
 # Start refueler helper: launch ghost_refueler in background and persist PID
 start_refueler() {
     mkdir -p "${BASE_DIR}/tmp" 2>/dev/null || true
+    local pidfile="${BASE_DIR}/tmp/crimson_refueler.pid"
+    # If a refueler pidfile exists and the process is alive, do not start another
+    if [[ -f "$pidfile" ]]; then
+        local existing; existing=$(cat "$pidfile" 2>/dev/null || true)
+        if [[ -n "$existing" && $(kill -0 "$existing" 2>/dev/null; echo $?) -eq 0 ]]; then
+            log INFO "Refueler already running (PID ${existing})"
+            return 0
+        fi
+    fi
     # Launch isolated engine worker (refueler)
     "${BASE_DIR}/lib/proxy_engine/refueler.sh" > /tmp/refueler.log 2>&1 &
     local pid=$!
-    echo "$pid" > "${BASE_DIR}/tmp/crimson_refueler.pid" 2>/dev/null || true
+    echo "$pid" > "$pidfile" 2>/dev/null || true
     echo "$pid" > /tmp/refueler.pid 2>/dev/null || true
     return 0
 }
@@ -318,8 +327,8 @@ show_identity() {
     
     # Also query ifconfig.co for additional routing info (IP, region) via proxy when possible
     local ifconf_info=""
-    if [[ -n "${prov_addr:-}" ]]; then
-        ifconf_info=$(command curl -s --socks5-hostname "$prov_addr" --connect-timeout 5 "https://ifconfig.co/json" 2>/dev/null || true)
+    if [[ -n "${proxy_addr:-}" ]]; then
+        ifconf_info=$(command curl -s --socks5-hostname "$proxy_addr" --connect-timeout 5 "https://ifconfig.co/json" 2>/dev/null || true)
     else
         ifconf_info=$(command curl -s --connect-timeout 5 "https://ifconfig.co/json" 2>/dev/null || true)
     fi
@@ -336,8 +345,7 @@ show_identity() {
             ic_ip_f=$(echo "$ifconf_info" | grep -oP '"ip"\s*:\s*"\K[^"]+' 2>/dev/null || true)
             printf "[🔎] IFCONFIG: IP: %s\n" "${ic_ip_f:-Unknown}" || true
         fi
-    fi
-    fi
+        fi
 
     return 0
 }
@@ -351,7 +359,7 @@ monitor_errors_and_rotate() {
     [[ -z "$logfile" || ! -f "$logfile" ]] && return
 
     local hits
-    hits=$(tail -n "$window_lines" "$logfile" 2>/dev/null | grep -E ' 403| 429|HTTP/1.[01]" 4' | wc -l || echo 0)
+    hits=$(_tail "$window_lines" "$logfile" 2>/dev/null | grep -E ' 403| 429|HTTP/1.[01]" 4' | wc -l || echo 0)
     if [[ "$hits" -ge "$threshold" ]]; then
         log WARN "Proxy Rotation: Detected ${hits} 403/429 responses in ${logfile}; refreshing proxy pool..."
         refresh_proxies

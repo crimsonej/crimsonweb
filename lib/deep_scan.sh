@@ -28,7 +28,7 @@ if command -v masscan >/dev/null 2>&1; then
 fi
 
 # Fallback to naabu if masscan not available or produced no output
-if [[ ! -s "$OPEN_FILE" && command -v naabu >/dev/null 2>&1 ]]; then
+if [[ ! -s "$OPEN_FILE" ]] && command -v naabu >/dev/null 2>&1; then
     echo "[*] Using naabu fallback for full-range scan"
     # Use port range to cover all ports
     naabu -host "$TARGET" -p 1-65535 -rate 2000 -o "$OUTPUT_DIR/naabu.out" 2>/dev/null || true
@@ -39,7 +39,7 @@ if [[ ! -s "$OPEN_FILE" && command -v naabu >/dev/null 2>&1 ]]; then
 fi
 
 # As a last resort, attempt nmap fast scan for common ports if nothing found
-if [[ ! -s "$OPEN_FILE" && command -v nmap >/dev/null 2>&1 ]]; then
+if [[ ! -s "$OPEN_FILE" ]] && command -v nmap >/dev/null 2>&1; then
     echo "[*] No open ports discovered by fast scanners; running nmap SYN scan for common ports (may be slow)"
     nmap -p- --min-rate 1000 -T4 -oG "$OUTPUT_DIR/nmap_greppable.out" "$TARGET" 2>/dev/null || true
     if [[ -f "$OUTPUT_DIR/nmap_greppable.out" ]]; then

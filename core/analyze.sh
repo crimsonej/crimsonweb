@@ -53,7 +53,7 @@ phase_analyze() {
     check_proxy
 
     # Ensure standard phase directories exist
-    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" 2>/dev/null || true
+    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/raw" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" 2>/dev/null || true
 
     local in_crawl="${TARGET_DIR}/CRAWL_results.txt"
     local js_list="${TARGET_DIR}/websites/js_urls.txt"

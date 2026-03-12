@@ -1,5 +1,6 @@
 [[ -n "${UI_SOURCED:-}" ]] && return
 export UI_SOURCED=true
+LIB_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ═══════════════════════════════════════════════════════════════════════════════
 #  §1  COLOUR PALETTE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -174,7 +175,7 @@ show_discovery_window() {
     
     # Continuous tail of discovered assets with clean formatting (no bloat)
     # Filters out tool output noise and shows only actual discovered data
-    tail -q -f "${raw_dir}"/*.txt 2>/dev/null | grep -v '^$' | while read -r line; do
+    _tailf "${raw_dir}/*.txt" 2>/dev/null | grep -v '^$' | while read -r line; do
         # Skip tool metadata bloat
         [[ "$line" =~ ^Processed\ |^Found\ |^Total\ |^\\[.*\\]$ ]] && continue
         [[ -z "$line" ]] && continue
@@ -190,6 +191,43 @@ show_discovery_window() {
             printf "  ${BCY}[ASSET]${RST} ${WH}%s${RST}\\n" "$line"
         fi
     done &
+}
+
+# ─── ACTIVE CONTROL: Keyboard Listener ───────────────────────────────────────
+
+# Global control PID
+export CONTROL_PID=""
+
+# Listen for "Enter", "Space" or "s" key to trigger skip signal
+start_control_listener() {
+    # Kill any existing listeners first
+    pkill -f "read -s -n 1 key" > /dev/null 2>&1 || true
+    (
+        while true; do
+            # Use /dev/tty to ensure input capture even in background
+            if read -s -n 1 key < /dev/tty 2>/dev/null; then
+                # If Enter (empty string), Space (" "), or 's' is pressed
+                if [[ -z "$key" || "$key" == " " || "$key" == "s" ]]; then
+                    touch "/tmp/crimson_skip"
+                fi
+            fi
+        done
+    ) &
+    CONTROL_PID=$!
+    # Disown to avoid "Killed" message clutter in TTY
+    disown "$CONTROL_PID" 2>/dev/null || true
+}
+
+# Stop the keyboard listener
+stop_control_listener() {
+    if [[ -n "${CONTROL_PID:-}" ]]; then
+        kill -9 "$CONTROL_PID" >/dev/null 2>&1 || true
+        wait "$CONTROL_PID" 2>/dev/null || true # Reap the process silently
+        unset CONTROL_PID
+    fi
+    # Force kill any stuck read builtins stealing TTY input
+    pkill -f "read -s -n 1 key" >/dev/null 2>&1 || true
+    rm -f "/tmp/crimson_skip" 2>/dev/null || true
 }
 
 # Progress Map
@@ -335,8 +373,9 @@ start_phase_streamer() {
     
     # Launch refined streamer targeting raw files
     nohup bash -c "
+        source \"${LIB_PATH}/utils.sh\"
         echo -e \"\n  ${BCY}[${phase}-LIVE] Waiting for asset discovery...${RST}\"
-        tail -q -f $file_pattern 2>/dev/null | while read -r line; do
+        _tailf \"$file_pattern\" 2>/dev/null | while read -r line; do
             [[ -z \"\$line\" ]] && continue
             [[ \"\$line\" =~ ^Processed|^Found|^Total|^\\[.*\\] ]] && continue
             
@@ -354,19 +393,56 @@ start_phase_streamer() {
         done
     " >> "${TARGET_DIR}/logs/streaming.log" 2>&1 &
     
-    export PHASE_STREAMER_PID=$!
+    local pid=$!
+    export PHASE_STREAMER_PID=$pid
+    register_streamer_pid $pid
 }
 
-# Stop the current phase streamer
+# Universal Result Streamer [NEW]
+# Streams findings from any log file instantly with custom formatting
+stream_results() {
+    local log_file="$1"
+    local prefix="$2"
+    local color="$3"
+    [[ -z "$log_file" || -z "$prefix" ]] && return
+    
+    # Ensure log file exists before tailing to avoid errors
+    touch "$log_file" 2>/dev/null
+    
+    # Start a background tail that only prints actual findings
+    nohup bash -c "
+        source \"${LIB_PATH}/utils.sh\"
+        _tailf \"$log_file\" 2>/dev/null | grep -vE 'finished|starting|Processed|Scanning|Progress|Found 0' | while read -r line; do 
+            [[ -z \"\$line\" ]] && continue
+            printf \"  ${color}[%s]\033[0m \033[1;32m⚡\033[0m Found: \033[1;37m%s\033[0m\n\" \"$prefix\" \"\$line\"; 
+        done" > /dev/null 2>&1 &
+    
+    local streamer_pid=$!
+    register_streamer_pid $streamer_pid
+    echo "$streamer_pid"
+}
+
+# Stop the current phase streamer and all background discovery tails
 stop_phase_streamer() {
     local pid="${PHASE_STREAMER_PID:-}"
     if [[ -n "$pid" ]]; then
         kill -9 "$pid" 2>/dev/null || true
         unset PHASE_STREAMER_PID
     fi
+    
+    # Robustly kill all active tail processes started by our streamers
+    # This ensures no 'ghost' results bleed between phases
+    pkill -9 -f "_tailf ${TARGET_DIR}/" 2>/dev/null || true
+    pkill -9 -f "_tailf ${TARGET_DIR}/tools_used/" 2>/dev/null || true
+    
+    # Also clear the registered streamer array for this phase
+    for pid in "${UI_STREAMER_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    UI_STREAMER_PIDS=()
 }
 
-# Legacy wrapper for background compatibility
+# Universal Log Streamer for background monitoring
 start_log_stream() {
     start_phase_streamer "SYSTEM" "${TARGET_DIR}/tools_used/*.log"
 }

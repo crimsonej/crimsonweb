@@ -20,6 +20,7 @@ phase_surface() {
     phase_should_run "SURFACE" || { log SKIP "SURFACE — already completed."; return; }
     CURRENT_PHASE="SURFACE"
     print_phase_map
+    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/raw" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" 2>/dev/null || true
     
     check_phase_tools "SURFACE" naabu httpx cloudkiller nmap || true
     # Ensure cloudkiller/subdomain helper file exists to avoid crashes
@@ -68,17 +69,24 @@ phase_surface() {
     touch "${in_recon}" "${subs_file}"
 
     # Launch naabu (passive) and assetfinder in parallel
+    # 1. Naabu (Passive)
     if tool_exists naabu; then
-        log INFO "naabu (passive) starting..."
-        CURRENT_TOOL="naabu-passive"
-        run_live "naabu -silent -passive -list '${in_recon}' -o '${raw}/naabu_passive.txt'" "${raw}/naabu_passive.log" "NAABU_PASSIVE" &
+        job_limiter
+        local na_log="${raw}/naabu_passive.log"
+        local na_out="${raw}/naabu_passive.txt"
+        stream_results "$na_out" "NAABU" "\033[1;35m"
+        run_live "naabu -silent -passive -list '${in_recon}' -o '$na_out'" "$na_log" "NAABU_PASSIVE" "$na_out" &
         register_batch_pid $!
     fi
 
+    # 2. Assetfinder
     if tool_exists assetfinder; then
-        log INFO "assetfinder starting..."
-        CURRENT_TOOL="assetfinder"
-        run_live "assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
+        job_limiter
+        local af_log="${raw}/assetfinder.log"
+        local af_out="${raw}/assetfinder.txt"
+        stream_results "$af_out" "ASSETFINDER" "\033[1;34m"
+        export CURRENT_TOOL="assetfinder"
+        run_live "timeout 10m assetfinder --subs-only '${TARGET}'" "$af_log" "ASSETFINDER" "$af_out" &
         register_batch_pid $!
     fi
 
@@ -108,10 +116,9 @@ phase_surface() {
     [[ ! -x "$httpx_bin" ]] && httpx_bin=$(command -v httpx 2>/dev/null || true)
     
     if [[ -n "${httpx_bin}" && -x "${httpx_bin}" ]]; then
-        log INFO "httpx validating subs (tech-detect active)..."
         CURRENT_TOOL="httpx-validation"
-        start_phase_streamer "SURFACE" "${live_file}"
-        run_live "'${httpx_bin}' -l '${subs_file}' -silent -sr -follow-redirects -tech-detect -status-code -timeout 15 -rl 30 -H 'User-Agent: ${ua}' -o '${live_file}'" "${raw}/httpx.log" "HTTPX_VALID" &
+        stream_results "$live_file" "HTTPX" "\033[1;32m"
+        run_live "'${httpx_bin}' -l '${subs_file}' -silent -sr -follow-redirects -tech-detect -status-code -timeout 15 -rl 30 -H 'User-Agent: ${ua}' -o '${live_file}'" "${raw}/httpx.log" "HTTPX_VALID" "$live_file" &
         register_batch_pid $!
     else
         log WARN "httpx not available; treating subs as live hosts"
@@ -138,6 +145,7 @@ phase_surface() {
         log INFO "Launching Parallel Cloud Hunt (Timeout: 20s)..."
         if [[ -s "${live_file}" ]]; then
             CURRENT_TOOL="cloudkiller"
+            stream_results "$ck_out" "CLOUD" "\033[1;36m"
             while IFS= read -r host; do
                 [[ -f "/tmp/crimson_skip" ]] && { log WARN "Skip signal detected. Terminating Cloud Hunt."; break; }
                 [[ -z "${host}" ]] && continue
@@ -218,7 +226,8 @@ phase_surface() {
             fi
             
             # Execute in background and stream logs
-            eval "$nmap_cmd" 2>&1 | tee >(awk '{print "[\033[1;34mNMAP\033[0m] " $0}' >> "${raw}/nmap_${safe_host}.log") >/dev/null &
+            stream_results "$out_file" "NMAP" "\033[1;34m"
+            eval "$nmap_cmd" 2>&1 | tee -a "${raw}/nmap_${safe_host}.log" >/dev/null &
             register_batch_pid $!
         done
         monitor_jobs "SURFACE_NMAP"

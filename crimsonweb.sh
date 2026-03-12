@@ -57,12 +57,13 @@ mkdir -p "${TARGET_DIR}" 2>/dev/null || true
 
 # --- [ CORE LIBRARIES ] ---
 source "${BASE_DIR}/lib/ansi.sh"       # HUD colors
-source "${BASE_DIR}/lib/utils.sh"      # Common utilities and ASCII tools
-source "${BASE_DIR}/lib/framework.sh"  # Core orchestration logic
 source "${BASE_DIR}/lib/jobs.sh"       # Job control and logging mechanisms
 source "${BASE_DIR}/lib/ui.sh"         # Centralized UI output logic
 source "${BASE_DIR}/lib/tg_c2.sh"      # Telegram C2 integration
 source "${BASE_DIR}/lib/intelligence.sh" # Vault management
+# --- [ CORE LIBRARIES ] ---
+source "${BASE_DIR}/lib/utils.sh"      # Common utilities and ASCII tools
+source "${BASE_DIR}/lib/framework.sh"  # Core orchestration & utilities
 
 # Phase Modules
 source "${BASE_DIR}/core/recon.sh"      # Phase 1
@@ -272,26 +273,49 @@ main() {
     mkdir -p "${TARGET_DIR}/tools_used" "${TARGET_DIR}/vulnerabilities" "${TARGET_DIR}/screenshots" "${TARGET_DIR}/raw" 2>/dev/null || true
     touch "${TARGET_DIR}/RECON_results.txt"
 
-    # Step 10: print_welcome
-    print_welcome
+    # Step 11: Active Job Control & Phase decision
+    start_control_listener
     log PHASE "Initiating Crimson Web modular operation on: ${WH}${TARGET}${RST}"
 
     # Step 11: Decide whether to skip / re-run RECON based on websites/live_urls.txt
     if [[ -d "${TARGET_DIR}" && -s "${TARGET_DIR}/websites/live_urls.txt" ]]; then
         if [[ -t 0 ]]; then
-            read -t 15 -r -p "[?] Target data exists. Force fresh scan? [y/N]: " force_scan || true
-            if [[ -z "$force_scan" || "$force_scan" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-                log INFO "Force rescan requested. Purging existing target vault: ${TARGET_DIR}"
-                rm -rf "${TARGET_DIR}" || true
-                mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/vulnerabilities" 2>/dev/null || true
+            stop_control_listener 2>/dev/null || true
+            
+            # Clear the keyboard buffer so old keystrokes don't trigger the skip
+            while read -r -t 0.1; do :; done 
+            
+            # Reset terminal to standard "sane" mode
+            stty sane 2>/dev/null
+            
+            echo -e "\n${YLW}[?] Target data exists for ${WH}${TARGET}${RST}"
+            # Explicitly read from /dev/tty and allow 20 seconds
+            if read -r -p "Force fresh scan? [y/N]: " -t 20 force_scan < /dev/tty; then
+                log INFO "Input received: $force_scan"
             else
-                log SKIP "RECON — live_urls present and non-empty; skipping recon as operator chose not to rescan."
-                phase_complete "RECON" || true
+                log WARN "No input detected within timeout. Defaulting to SKIP."
+                force_scan="n"
+            fi
+            
+            start_control_listener 2>/dev/null || true
+            
+            if [[ "$force_scan" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+                log WARN "PERFORMING FRESH SCAN: Nuking ${TARGET_DIR}..."
+                # Force removal and wait for disk to sync
+                rm -rf "${TARGET_DIR}" 2>/dev/null && sync
+                
+                # Rebuild the core vault structure
+                mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" "${TARGET_DIR}/vulnerabilities" "${TARGET_DIR}/screenshots" "${TARGET_DIR}/raw" 2>/dev/null
+                touch "${TARGET_DIR}/RECON_results.txt"
+            else
+                log SKIP "Using existing data. Skipping RECON phase."
+                phase_complete "RECON" 2>/dev/null || true
             fi
         else
             log INFO "Non-interactive: forcing fresh scan (purging target vault)."
-            rm -rf "${TARGET_DIR}" || true
-            mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/vulnerabilities" 2>/dev/null || true
+            rm -rf "${TARGET_DIR}" 2>/dev/null && sync
+            mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" "${TARGET_DIR}/vulnerabilities" "${TARGET_DIR}/screenshots" "${TARGET_DIR}/raw" 2>/dev/null
+            touch "${TARGET_DIR}/RECON_results.txt"
         fi
     fi
 

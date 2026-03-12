@@ -29,6 +29,7 @@ run_live() {
     local cmd="$1"
     local log_file="$2"
     local tag="$3"
+    local preview_file="${4:-$log_file}"
     
     # Ensure environment is sane
     path_fix
@@ -68,7 +69,7 @@ run_live() {
     local count; count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
 
     # §PERF: Only scan last 20 lines for rate-limit signals — avoids full-file grep on 200K+ line logs
-    if tail -n 20 "$log_file" 2>/dev/null | grep -qE "1015|\b429\b|rate limit|error 1015|error 429|HTTP/1\.[01] 403"; then
+    if _tail 20 "$log_file" 2>/dev/null | grep -qE "1015|\b429\b|rate limit|error 1015|error 429|HTTP/1\.[01] 403"; then
         log WARN "Rate-limit detected in ${tag} output. Increasing jitter and rotating proxy..."
         export JITTER_MIN=3
         export JITTER_MAX=8
@@ -82,8 +83,10 @@ run_live() {
     if [[ $exit_code -eq 0 ]]; then
         hb_log "$tag" "${tag} finished. Processed ${BCY}${count}${RST} results."
         # Print a brief findings preview for operator
-        printf "  ${BCY}[${tag}] Findings preview (last 20 lines):${RST}\n"
-        tail -n 20 "$log_file" 2>/dev/null | sed 's/^/    /'
+        if [[ -s "$preview_file" ]]; then
+            printf "  ${BCY}[${tag}] Findings preview (Displaying: $(basename "$preview_file")):${RST}\n"
+            _tail 20 "$preview_file" 2>/dev/null | sed 's/^/    /'
+        fi
     elif [[ $exit_code -eq 1 && ! -s "$log_file" ]]; then
         hb_log "$tag" "${tag} finished. ${BCY}0 results found.${RST}"
     else
@@ -96,7 +99,7 @@ run_live() {
 
     # Pulse Check: If a tool exited very quickly (<2s) with an error, capture tail and notify
     if [[ $exit_code -ne 0 && $elapsed -lt 2 ]]; then
-        local tail_out; tail_out=$(tail -n 5 "$log_file" 2>/dev/null || echo "(no log output)")
+        local tail_out; tail_out=$(_tail 5 "$log_file" 2>/dev/null || echo "(no log output)")
         log WARN "${tag} terminated quickly (<=2s). Sending pulse diagnostics to C2."
         tg_send "⚠️ <b>Quick Failure</b>\nTool: <code>${tag}</code>\nExit: <code>${exit_code}</code>\nLast lines:\n<pre>${tail_out}</pre>"
     fi
@@ -106,6 +109,7 @@ run_live() {
 monitor_jobs() {
     local phase="$1"
     local start_time; start_time=$(date +%s)
+    local idle_stall_count=0
     
     # Normalize sub-phase labels so HUD treats SURFACE_* as SURFACE, etc.
     local hud_phase="$phase"
@@ -118,6 +122,32 @@ monitor_jobs() {
 
     # §FIX: Monitor CURRENT_BATCH_PIDS array instead of generic 'jobs'
     while true; do
+        # 1. IMMEDIATE SKIP CHECK (Reduce lag)
+        if [[ -f "/tmp/crimson_skip" ]]; then
+            log WARN "SKIP REQUESTED: Allowing tools to save and flush..."
+            
+            # Stage 1: Polite Shutdown (SIGTERM)
+            for pid in "${CURRENT_BATCH_PIDS[@]}"; do
+                pkill -15 -P "$pid" 2>/dev/null # Terminate children
+                kill -15 "$pid" 2>/dev/null     # Terminate parent
+            done
+            
+            sleep 2 # Grace period for disk write/flush
+            
+            # Stage 2: Hard Kill (only if still alive)
+            for pid in "${CURRENT_BATCH_PIDS[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    pkill -9 -P "$pid" 2>/dev/null 
+                    kill -9 "$pid" 2>/dev/null 
+                fi
+                wait "$pid" 2>/dev/null        # Silent reap
+            done
+            
+            rm -f "/tmp/crimson_skip"
+            CURRENT_BATCH_PIDS=()
+            break 
+        fi
+
         local running_pids=()
         for pid in "${CURRENT_BATCH_PIDS[@]}"; do
             if kill -0 "$pid" 2>/dev/null; then
@@ -136,7 +166,7 @@ monitor_jobs() {
         case "$hud_phase" in
             RECON|CRAWL)
                 # Find the most recent mtime across all logs
-                local newest_mtime; newest_mtime=$(find "${log_glob}" -name "*.log" -newer /tmp/.spw_loot_mtime_${hud_phase} 2>/dev/null | head -1)
+                local newest_mtime; newest_mtime=$(find "${log_glob}" -name "*.log" -newer /tmp/.spw_loot_mtime_${hud_phase} 2>/dev/null | head -n 1)
                 if [[ -n "$newest_mtime" || ! -f "/tmp/.spw_loot_count_${hud_phase}" ]]; then
                     cur_loot=$(cat "${log_glob}"*.log 2>/dev/null | wc -l || echo 0)
                     echo "$cur_loot" > "/tmp/.spw_loot_count_${hud_phase}"
@@ -145,7 +175,7 @@ monitor_jobs() {
                     cur_loot=$(cat "/tmp/.spw_loot_count_${hud_phase}" 2>/dev/null || echo 0)
                 fi
                 ;;
-            SURFACE) cur_loot=$(wc -l < "${TARGET_DIR}/tools_used/httpx.log" 2>/dev/null || echo 0) ;;
+            SURFACE) cur_loot=$(cat "${TARGET_DIR}/tools_used/httpx.log" 2>/dev/null | wc -l) ;;
             VULNS)   cur_loot=$(find "${TARGET_DIR}/vulnerabilities" -type f -exec cat {} + 2>/dev/null | wc -l || echo 0) ;;
         esac
 
@@ -159,6 +189,16 @@ monitor_jobs() {
         esac
         [[ $progress -gt 100 ]] && progress=100
 
+        # §FIX: If we are at 100% (based on timer) but still have live jobs, cap at 99%
+        if [[ $progress -ge 100 ]] && [[ $running -gt 0 ]]; then
+            progress=99
+            # §NEW: Assetfinder Auto-Skip (Don't let it stall even for 1 second at 99%)
+            if [[ "$CURRENT_TOOL" == "assetfinder" ]]; then
+                log WARN "Assetfinder reached time limit. Triggering Auto-Skip..."
+                touch "/tmp/crimson_skip"
+            fi
+        fi
+
         # ENHANCED HUD: Persistent status bar using ANSI escape codes
         hud_render "$running" "$cur_loot" "${CNT_VULNS:-0}" "$progress"
         
@@ -166,15 +206,18 @@ monitor_jobs() {
         [[ -f /tmp/crimson_skip ]] && remote_skip=true
 
         # §FIX: Check for global ABORTED signal or explicit /skip command
-        if [[ "${ABORTED:-0}" == "1" ]] || [[ "$remote_skip" == "true" ]]; then
-            log WARN "Skip Signal received. Cleaning up current batch..."
-            # Terminate all PIDs in the current batch for immediate transition
-            for pid in "${CURRENT_BATCH_PIDS[@]}"; do
-                kill -9 "$pid" 2>/dev/null || true
-            done
-            CURRENT_BATCH_PIDS=()
-            rm -f /tmp/crimson_skip
-            break
+        # (Legacy skip check removed, moved to top of loop)
+        
+        # §NEW: Universal Stall Breaker - Detect if ANY tool is stuck at 99% for too long
+        if [[ $progress -eq 99 ]]; then
+            ((idle_stall_count++))
+            if [[ $idle_stall_count -gt 120 ]]; then # ~60s+ of stall at 99%
+                log WARN "Stall detected in phase ${phase} (tool: ${CURRENT_TOOL:-unknown}). Force-clearing batch PIDs."
+                CURRENT_BATCH_PIDS=()
+                break
+            fi
+        else
+            idle_stall_count=0
         fi
         sleep 0.5
     done

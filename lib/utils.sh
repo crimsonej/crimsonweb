@@ -7,17 +7,24 @@ export UTILS_SOURCED=true
 # Global PID Registry
 declare -a RUNNING_PIDS=()
 declare -a CURRENT_BATCH_PIDS=()
+declare -a UI_STREAMER_PIDS=()
 
-# Register a PID for tracking
+# Register a PID for tracking (standalone/background tasks)
 register_pid() {
     local pid="$1"
     [[ -n "$pid" ]] && RUNNING_PIDS+=("$pid")
 }
 
-# Register a PID specifically for the current tool batch
+# Register a PID specifically for the current tool batch (monitored by HUD)
 register_batch_pid() {
     local pid="$1"
     [[ -n "$pid" ]] && CURRENT_BATCH_PIDS+=("$pid") && RUNNING_PIDS+=("$pid")
+}
+
+# Register a PID specifically for UI streamers/tailers (ignored by monitor_jobs)
+register_streamer_pid() {
+    local pid="$1"
+    [[ -n "$pid" ]] && UI_STREAMER_PIDS+=("$pid") && RUNNING_PIDS+=("$pid")
 }
 
 # Master Cleanup Handler
@@ -35,10 +42,15 @@ master_cleanup() {
 
     # 2. Terminate tracked background workers
     log WARN "Master Cleanup: Terminating tracked processes..."
+    stop_control_listener 2>/dev/null || true
     for pid in "${RUNNING_PIDS[@]}"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
         fi
+    done
+    # Force kill streamers if they didn't catch the TERM
+    for pid in "${UI_STREAMER_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
     done
 
     # 3. Clean temporary artifacts (do not wipe terminal output)
@@ -84,8 +96,37 @@ _tail() {
     if command -v tail &>/dev/null; then
         tail -n "$n" "$file"
     else
+        # Robust awk-based tail-n
         awk -v n="$n" '{lines[NR % n] = $0} END {start = (NR < n) ? 1 : NR + 1; for (i = 0; i < (NR < n ? NR : n); i++) print lines[(start + i) % n]}' "$file"
     fi
+}
+
+# §NEW: Fallback for tail -f (Long-polling mode)
+_tailf() {
+    local pattern="$1"
+    # Basic emulation of tail -f using bash+dd+sleep
+    # Supports globbing patterns and single files
+    declare -A offsets
+    while true; do
+        for f in $pattern; do
+            [[ -f "$f" ]] || continue
+            local current_size=$(wc -c < "$f" 2>/dev/null || echo 0)
+            local last_size="${offsets["$f"]:-$current_size}"
+            
+            if [[ $current_size -gt $last_size ]]; then
+                # Found new data! Use dd to extract starting from previous offset
+                dd if="$f" bs=1 skip="$last_size" 2>/dev/null
+                offsets["$f"]=$current_size
+            elif [[ $current_size -lt $last_size ]]; then
+                # File was truncated or rotated
+                offsets["$f"]=0
+            else
+                # No change: initialize offset if first time seeing this file
+                [[ -z "${offsets["$f"]}" ]] && offsets["$f"]=$current_size
+            fi
+        done
+        sleep 1
+    done
 }
 
 # Path fixing utility

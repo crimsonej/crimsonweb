@@ -277,7 +277,7 @@ error_streamer() {
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]] && return
     local err_log="${TARGET_DIR}/logs/error.log"
     while [[ ! -f "$err_log" ]]; do sleep 5; done
-    tail -f "$err_log" | while read -r line; do
+    _tailf "$err_log" | while read -r line; do
         if [[ -n "$line" ]]; then
             local cl; cl=$(echo "$line" | sed 's/\x1b\[[0-9;]*[mK]//g')
             tg_send "⚠️ <b>ERROR</b>: <code>${cl:0:1000}</code>"
@@ -346,7 +346,7 @@ tg_executor() {
                 ;;
             logs)
                 # Send last 10 lines of /tmp/crimson_sync.log
-                local logs; logs=$(tail -n 10 /tmp/crimson_sync.log 2>/dev/null || echo "No logs available")
+                local logs; logs=$(_tail 10 /tmp/crimson_sync.log 2>/dev/null || echo "No logs available")
                 tg_send "*Last 10 lines of /tmp/crimson_sync.log*\n\n\`\`\`${logs}\n\`\`\`"
                 ;;
             websites)

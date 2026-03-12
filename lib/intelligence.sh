@@ -32,11 +32,15 @@ init_settings() {
 # Vault Setup
 init_vault() {
     TARGET_SAFE="${TARGET//[^a-zA-Z0-9._-]/_}"
-    # Use absolute VAULT_PATH if provided, otherwise fall back to VAULT_ROOT
+    # Use absolute VAULT_PATH if provided, otherwise fall back to VAULT_ROOT under BASE_DIR
     if [[ -n "${VAULT_PATH:-}" ]]; then
-        TARGET_DIR="${VAULT_PATH}/${TARGET_SAFE}"
+        if [[ "${VAULT_PATH}" == /* ]]; then
+            TARGET_DIR="${VAULT_PATH}/${TARGET_SAFE}"
+        else
+            TARGET_DIR="${BASE_DIR}/${VAULT_PATH}/${TARGET_SAFE}"
+        fi
     else
-        TARGET_DIR="${VAULT_ROOT}/${TARGET_SAFE}"
+        TARGET_DIR="${BASE_DIR}/${VAULT_ROOT}/${TARGET_SAFE}"
     fi
     
     # §FIX: Centralized Mandatory Directory Initialization
@@ -146,6 +150,12 @@ phase_should_run() {
             return 0
         fi
 
+        # Pause global keyboard skip listener so it doesn't steal input
+        stop_control_listener 2>/dev/null || true
+        # Reset terminal state to grab keyboard focus cleanly
+        stty echo lnext ^V 2>/dev/null || true
+        # Add a visual hint to the HUD so the user knows to look at the prompt
+        hud_event "*" "Waiting for $phase decision (terminal or Telegram)..."
         printf "[?] %s already completed. Re-run? (y/N) — default Re-run in 20s: " "$phase"
         local decision=""
         local timeout_secs=20
@@ -171,7 +181,8 @@ phase_should_run() {
 
             # Check local terminal input (non-blocking)
             if [[ -t 0 ]]; then
-                if read -r -t 1 -n 256 local_ans 2>/dev/null; then
+                # Read directly from terminal device to bypass any pipe issues
+                if read -r -t 1 local_ans < /dev/tty 2>/dev/null; then
                     local_ans=$(echo "$local_ans" | tr '[:upper:]' '[:lower:]' | xargs 2>/dev/null || true)
                     if [[ "$local_ans" =~ ^(y|yes|rerun|retry)$ ]]; then
                         decision="y"; break
@@ -194,28 +205,38 @@ phase_should_run() {
 
         case "$decision" in
             y)
-                printf "\n[+] Operator selected: Re-run %s\n" "$phase"
-                # Purge existing target vault and marker so a fresh scan starts
-                if [[ -n "${TARGET_DIR:-}" ]]; then
-                    rm -rf "${TARGET_DIR}" 2>/dev/null || true
-                fi
+                printf "\n[+] Operator selected: Fresh scan for %s. Purging old data...\n" "$phase"
+                # Targeted Purge: Only wipe the specific folders for this phase
+                case "$phase" in
+                    RECON)   rm -rf "${TARGET_DIR}/raw" "${TARGET_DIR}/loot" 2>/dev/null ;;
+                    SURFACE) rm -rf "${TARGET_DIR}/websites" 2>/dev/null ;;
+                    CRAWL)   rm -f "${TARGET_DIR}/websites/master_urls.txt" "${TARGET_DIR}/websites/js_urls.txt" 2>/dev/null ;;
+                    ANALYZE) rm -rf "${TARGET_DIR}/analysis" 2>/dev/null ;;
+                esac
+                
+                # Remove the phase marker
                 if [[ -f "$marker_file" ]]; then
                     rm -f "$marker_file" 2>/dev/null || true
                 fi
+                # Resume keyboard listener
+                start_control_listener 2>/dev/null || true
                 # Ensure subsequent phases run automatically without prompting
                 export FORCE_ALL=true
                 return 0
                 ;;
             a)
                 printf "\n[!] Operator selected: Abort\n"
+                start_control_listener 2>/dev/null || true
                 return 1
                 ;;
             n)
                 printf "\n[-] Skipping %s (operator selected)\n" "$phase"
+                start_control_listener 2>/dev/null || true
                 return 1
                 ;;
             *)
                 printf "\n[-] Skipping %s (default action)\n" "$phase"
+                start_control_listener 2>/dev/null || true
                 return 1
                 ;;
         esac

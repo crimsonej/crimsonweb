@@ -19,6 +19,7 @@ phase_recon() {
     fi
     CURRENT_PHASE="RECON"
     print_phase_map; print_loot
+    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/raw" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" 2>/dev/null || true
     # Check for existing results to resume/skip
     if [ -f "${TARGET_DIR}/${CURRENT_PHASE}_results.txt" ]; then
         printf "  ${BCY}[?]${RST} Existing data found for this phase. [S]kip to next phase, [R]e-scan, or [A]ppend new results? (15s timeout) "
@@ -59,54 +60,65 @@ phase_recon() {
     
     # Launch tools in background and register PIDs
     start_phase_streamer "RECON" "${raw}/*.txt ${raw}/*.log"
+    # 1. Subfinder
     if tool_exists subfinder; then
         job_limiter
         check_c2
-        eval "subfinder -d '${TARGET}' -silent -t 150 -all -recursive -o '${raw}/subfinder.txt'" 2>&1 | tee -a "${raw}/subfinder.log" &
+        local sf_log="${raw}/subfinder.log"
+        local sf_out="${raw}/subfinder.txt"
+        stream_results "$sf_out" "SUBFINDER" "\033[1;34m"
+        eval "subfinder -d '${TARGET}' -silent -t 150 -all -recursive -o '$sf_out'" 2>&1 | tee -a "$sf_log" >/dev/null &
         register_batch_pid $!
         rate_limit  # Apply adaptive delay
     fi
 
+    # 2. Assetfinder
     if tool_exists assetfinder; then
         job_limiter
-        run_live "assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
+        local af_log="${raw}/assetfinder.log"
+        local af_out="${raw}/assetfinder.txt"
+        stream_results "$af_out" "ASSETFINDER" "\033[1;34m"
+        export CURRENT_TOOL="assetfinder"
+        run_live "timeout 10m assetfinder --subs-only '${TARGET}'" "$af_log" "ASSETFINDER" "$af_out" &
         register_batch_pid $!
         rate_limit
     fi
 
+    # 3. Amass
     if tool_exists amass; then
-        local total_ram; total_ram=$(free -m | awk '/^Mem:/{print $2}')
-        local avail_ram; avail_ram=$(free -m | awk '/^Mem:/{print $7}')
-        [[ -z "$avail_ram" ]] && avail_ram=$(free -m | awk '/^Mem:/{print $4+$6}')
-        
-        local amass_flags="-passive -timeout 10"
-        
         check_resources "amass"
         job_limiter
-        mkdir -p "$raw"
-        local amass_dir="/tmp/amass_session_$$"
-        mkdir -p "$amass_dir"
-        run_live "amass enum $amass_flags -d '${TARGET}' -dir '${amass_dir}' -o '${raw}/amass.txt'" "${raw}/amass.log" "AMASS" &
+        local am_log="${raw}/amass.log"
+        local am_out="${raw}/amass.txt"
+        local am_dir="/tmp/amass_session_$$"
+        mkdir -p "$am_dir"
+        stream_results "$am_out" "AMASS" "\033[1;36m"
+        run_live "amass enum -passive -timeout 10 -d '${TARGET}' -dir '${am_dir}' -o '$am_out'" "$am_log" "AMASS" &
         register_batch_pid $!
         rate_limit
     fi
 
+    # 4. GAU
     if tool_exists gau; then
         job_limiter
         check_c2
-        eval "gau --subs --threads ${THREADS:-50} --timeout 30 --providers wayback,commoncrawl,otx '${TARGET}'" 2>&1 | tee -a "${raw}/gau.log" &
+        local gau_log="${raw}/gau.log"
+        stream_results "$gau_log" "GAU" "\033[1;32m"
+        eval "gau --subs --threads ${THREADS:-50} --timeout 30 --providers wayback,commoncrawl,otx '${TARGET}'" 2>&1 | tee -a "$gau_log" >/dev/null &
         register_batch_pid $!
         # §FIX: Immediate High Alert Trigger
-        process_high_alert_links "${raw}/gau.log" &
+        process_high_alert_links "$gau_log" &
         register_pid $!
     fi
 
+    # 5. Waybackurls
     if tool_exists waybackurls; then
         job_limiter
-        run_live "echo '${TARGET}' | waybackurls" "${raw}/wayback.log" "WAYBACK" &
+        local wb_log="${raw}/wayback.log"
+        stream_results "$wb_log" "WAYBACK" "\033[1;33m"
+        run_live "echo '${TARGET}' | waybackurls" "$wb_log" "WAYBACK" &
         register_batch_pid $!
-        # §FIX: Immediate High Alert Trigger
-        process_high_alert_links "${raw}/wayback.log" &
+        process_high_alert_links "$wb_log" &
         register_pid $!
     fi
     

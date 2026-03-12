@@ -15,8 +15,8 @@ phase_crawl() {
     phase_should_run "CRAWL" || { log SKIP "CRAWL — already completed."; return; }
     CURRENT_PHASE="CRAWL"
     print_phase_map; print_loot
+    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/raw" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" 2>/dev/null || true
     # Ensure target website directories and a live_urls file exist (avoid crashes when missing)
-    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" 2>/dev/null || true
     touch "${TARGET_DIR}/websites/live_urls.txt"
     # Sanity check: ensure SURFACE results exist before crawling
     if [[ ! -s "${TARGET_DIR}/SURFACE_results.txt" ]]; then
@@ -74,22 +74,16 @@ phase_crawl() {
     check_phase_tools "CRAWL" katana hakrawler gau waybackurls || true
     section "PHASE 3: CRAWL — URL & Endpoint Extraction" "🕷️"
 
-    local in_surface="${TARGET_DIR}/SURFACE_results.txt"
-    # If SURFACE produced no results, seed it with TARGET to avoid idle pipeline
-    if [[ ! -s "${in_surface}" ]]; then
-        echo "${TARGET}" > "${in_surface}"
-        echo "[!] No SURFACE results; force-seeded ${in_surface} with TARGET to continue" >&2
-    fi
-    # Fallback if Phase 2 skipped or failed to produce results
-    [[ ! -s "$in_surface" ]] && in_surface="${TARGET_DIR}/websites/live_urls.txt"
-    
     local cdir="${TARGET_DIR}/websites"
     local raw="${TARGET_DIR}/tools_used"
     local out_urls="${cdir}/master_urls.txt"
     local ua; ua=$(ua_rand)
     
-    # Ensure the SURFACE input is correctly referenced and populate TARGETS
+    # 1. Directory & Variable Initialization
+    mkdir -p "$cdir" "$raw"
     local in_surface="${TARGET_DIR}/SURFACE_results.txt"
+
+    # Fallback logic if SURFACE failed or was skipped
     if [[ ! -s "${in_surface}" ]]; then
         log WARN "SURFACE results missing; falling back to websites/live_urls.txt"
         in_surface="${TARGET_DIR}/websites/live_urls.txt"
@@ -100,8 +94,6 @@ phase_crawl() {
         echo "${TARGET}" > "${in_surface}"
     fi
 
-    local TARGETS
-    TARGETS=$(awk 'NF' "${in_surface}" 2>/dev/null || true)
     log INFO "CRAWL: Seeding from $(wc -l < \"${in_surface}\" 2>/dev/null || echo \"0\") SURFACE-validated targets."
 
     # Display evasion status
@@ -117,52 +109,54 @@ phase_crawl() {
     # 1. KATANA & HAKRAWLER (Active Spidering)
     start_phase_streamer "CRAWL" "${raw}/*.txt"
     if tool_exists katana; then
-        log INFO "Katana \u2014 Headless deep crawl with UA rotation (depth 6)..."
+        log INFO "Katana — Headless deep crawl with UA rotation (depth 6)..."
         hud_event "*" "Starting Katana crawl on $(wc -l < \"${in_surface}\" 2>/dev/null || echo \"?\") targets..."
-        CURRENT_TOOL="katana"
         job_limiter
         local katana_log="${raw}/katana.log"
-        rm -f "${katana_log}" 2>/dev/null || true
-        eval "katana -list '${in_surface}' -hl -d 6 -jc -kf all -c '${THREADS}' -o '${raw}/katana.txt'" 2>&1 | tee >(awk '{print "[\033[1;34mKATANA\033[0m] " $0}' >> "${katana_log}") >/dev/null &
+        local katana_out="${raw}/katana.txt"
+        rm -f "${katana_log}" "${katana_out}" 2>/dev/null || true
+        run_live "katana -list '${in_surface}' -hl -d 6 -jc -kf all -c '${THREADS}'" "$katana_log" "KATANA" "$katana_out" &
         register_batch_pid $!
         rate_limit
     fi
 
     if tool_exists hakrawler; then
-        log INFO "hakrawler \u2014 active discovery with evasion..."
-        CURRENT_TOOL="hakrawler"
+        log INFO "hakrawler — active discovery with evasion..."
         job_limiter
         local hak_log="${raw}/hakrawler.log"
-        rm -f "${hak_log}" 2>/dev/null || true
-        cat "${in_surface}" | hakrawler -d 3 2>&1 | tee >(awk '{print "[\033[1;34mHAKRAWLER\033[0m] " $0}' >> "${hak_log}") > "${raw}/hakrawler.txt" &
+        local hak_out="${raw}/hakrawler.txt"
+        rm -f "${hak_log}" "${hak_out}" 2>/dev/null || true
+        run_live "cat '${in_surface}' | hakrawler -d 3" "$hak_log" "HAKRAWLER" "$hak_out" &
         register_batch_pid $!
         rate_limit
     fi
 
     # 2. GAU & WAYBACKURLS (Historical/Passive)
     if tool_exists gau; then
-        log INFO "gau \u2014 Passive URL harvest with evasion..."
+        log INFO "gau — Passive URL harvest with evasion..."
         hud_event "*" "Running GAU (passive discovery) on $(wc -l < \"${in_surface}\" 2>/dev/null || echo \"?\") domains..."
         job_limiter
         local gau_log="${raw}/gau.log"
-        rm -f "${gau_log}" 2>/dev/null || true
-        eval "gau --subs --threads '${THREADS:-50}' --timeout 30 --providers wayback,otx,commoncrawl '${TARGET}'" 2>&1 | tee >(awk '{print "[\033[1;34mGAU\033[0m] " $0}' >> "${gau_log}") > "${raw}/gau.txt" &
+        local gau_out="${raw}/gau.txt"
+        rm -f "${gau_log}" "${gau_out}" 2>/dev/null || true
+        run_live "gau --subs --threads '${THREADS:-50}' --timeout 30 --providers wayback,otx,commoncrawl '${TARGET}'" "$gau_log" "GAU" "$gau_out" &
         register_batch_pid $!
         rate_limit
     fi
 
     if tool_exists waybackurls; then
-        log INFO "waybackurls \u2014 pulling historical data..."
+        log INFO "waybackurls — pulling historical data..."
         job_limiter
         local wayback_log="${raw}/wayback.log"
-        rm -f "${wayback_log}" 2>/dev/null || true
-        echo "${TARGET}" | waybackurls 2>&1 | tee >(awk '{print "[\033[1;34mWAYBACK\033[0m] " $0}' >> "${wayback_log}") > "${raw}/wayback.txt" &
+        local wayback_out="${raw}/wayback.txt"
+        rm -f "${wayback_log}" "${wayback_out}" 2>/dev/null || true
+        run_live "echo '${TARGET}' | waybackurls" "$wayback_log" "WAYBACK" "$wayback_out" &
         register_batch_pid $!
         rate_limit
     fi
     
     # Wait for all background crawl tools to finish before consolidation
-    wait
+    monitor_jobs "CRAWL"
     stop_phase_streamer
 
     # 3. THE SIEVE: anew deduplication & classification
@@ -171,14 +165,14 @@ phase_crawl() {
 
     # Stream inputs directly to avoid large in-memory variables
     {
-        cat "${raw}"/katana.txt "${raw}"/hakrawler.log "${raw}"/gau.log "${raw}"/wayback.log 2>/dev/null || true
+        cat "${raw}/katana.txt" "${raw}/hakrawler.txt" "${raw}/gau.txt" "${raw}/wayback.txt" 2>/dev/null || true
     } | sort -u > "${out_urls}.tmp"
 
     # THE SIEVE: High-performance deduplication and classification
     hud_event "*" "[THE SIEVE] Starting merge & deduplication..."
     # Use RAM-backed workspace if available
     SIEVE_TMP="/dev/shm/crimson_sieve_${TARGET//[^a-zA-Z0-9]/_}"
-    if [[ -d "/dev/shm" && $(df --output=avail -k /dev/shm | tail -n1) -gt 524288 ]]; then
+    if [[ -d "/dev/shm" && $(df --output=avail -k /dev/shm | _tail 1) -gt 524288 ]]; then
         mkdir -p "${SIEVE_TMP}" 2>/dev/null || SIEVE_TMP="$(mktemp -d)"
     else
         SIEVE_TMP="$(mktemp -d)"
