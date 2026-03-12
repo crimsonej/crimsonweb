@@ -11,23 +11,20 @@ source "$LIB_PATH/jobs.sh"
 source "$LIB_PATH/tg_c2.sh"
 
 phase_vuln() {
-    phase_should_run "VULN" || { log SKIP "VULN — already completed."; return; }
-    CURRENT_PHASE="VULN"
+    phase_should_run "VULNS" || { log SKIP "VULNS — already completed."; return; }
+    CURRENT_PHASE="VULNS"
     PHASE_START_TIME=$(date +%s)  # Track phase start for summary
     print_phase_map; print_loot
     # Ensure websites directory exists and live_urls file is present to avoid "No such file" errors
-    mkdir -p "${TARGET_DIR}/websites/" 2>/dev/null || true
+    mkdir -p "${TARGET_DIR}/websites/" "${TARGET_DIR}/tools_used" 2>/dev/null || true
     touch "${TARGET_DIR}/websites/live_urls.txt" 2>/dev/null || true
     
     check_phase_tools "VULNS" nuclei dalfox ghauri ffuf subjack || true
     section "PHASE 5: VULNS — Active Vulnerability Probing" "☢️"
-    check_proxy
 
     local cdir="${TARGET_DIR}/websites"
     local raw="${TARGET_DIR}/tools_used"
     local vuln_dir="${TARGET_DIR}/vulnerabilities"
-    local px; px=$(proxy_prefix)
-    local pf; pf=$(proxy_flag)
     local ua; ua=$(ua_rand)
     
     # Display evasion strategy
@@ -52,14 +49,20 @@ phase_vuln() {
         mkdir -p "${TARGET_DIR}/websites/" 2>/dev/null || true
         touch "${TARGET_DIR}/websites/live_urls.txt" 2>/dev/null || true
         # Ensure the local LIVE_URLS dir exists in this shell before invoking Nuclei
-        mkdir -p "$(dirname "${cdir}/live_urls.txt")" 2>/dev/null || true
-        if [[ -s "${cdir}/live_urls.txt" ]]; then
-            run_live "${px} nuclei -ut -t /root/nuclei-templates/ -l '${cdir}/live_urls.txt' -H 'User-Agent: ${ua}' -t cves/ -t exposed-panels/ -t takeovers/ -t vulnerabilities/ -as -bulk-size 150 -c 50 -rl 300 -timeout 15 -o '${vuln_dir}/nuclei_results.json' ${pf:+-proxy '${pf}'}" "${raw}/nuclei.log" "NUCLEI" &
-            register_batch_pid $!
-        else
-            log WARN "Nuclei skipped: ${cdir}/live_urls.txt is missing or empty"
-        fi
+    # Ensure the input list is populated from the Surface/Crawl results
+    local live_urls_file="${cdir}/live_urls.txt"
+    if [[ ! -s "${live_urls_file}" ]]; then
+        log WARN "VULNS: live_urls.txt missing; falling back to SURFACE_results.txt"
+        cp "${TARGET_DIR}/SURFACE_results.txt" "${live_urls_file}" 2>/dev/null || true
+    fi
+
+    if [[ -s "${live_urls_file}" ]]; then
+        log INFO "VULNS: Seeding from $(wc -l < \"${live_urls_file}\" 2>/dev/null || echo \"0\") SURFACE-validated targets."
+        run_live "nuclei -t /root/nuclei-templates/ -l '${live_urls_file}' -H 'User-Agent: ${ua}' -t cves/ -t exposed-panels/ -t takeovers/ -t vulnerabilities/ -as -bulk-size 150 -c 50 -rl 300 -timeout 15 -o '${vuln_dir}/nuclei_results.json'" "${raw}/nuclei.log" "NUCLEI" &
         register_batch_pid $!
+    else
+        log WARN "Nuclei skipped: No targets found in ${live_urls_file} or SURFACE_results.txt"
+    fi
         rate_limit
     fi
 
@@ -69,7 +72,7 @@ phase_vuln() {
         CURRENT_TOOL="dalfox"
         job_limiter
         if [[ -s "${cdir}/parameterized_urls.txt" ]]; then
-            run_live "${px} dalfox file '${cdir}/parameterized_urls.txt' --silence -w 50 -H 'User-Agent: ${ua}' --output '${vuln_dir}/dalfox_xss.txt' ${pf:+-p '${pf}'}" "${raw}/dalfox.log" "DALFOX" &
+            run_live "dalfox file '${cdir}/parameterized_urls.txt' --silence -w 50 -H 'User-Agent: ${ua}' --output '${vuln_dir}/dalfox_xss.txt'" "${raw}/dalfox.log" "DALFOX" &
             register_batch_pid $!
         else
             log WARN "Dalfox skipped: ${cdir}/parameterized_urls.txt is missing or empty"
@@ -82,7 +85,7 @@ phase_vuln() {
         log INFO "Ghauri \u2014 SQLi detection with User-Agent rotation..."
         if [[ -s "${cdir}/parameterized_urls.txt" ]]; then
             mkdir -p "${vuln_dir}" 2>/dev/null || true
-            run_live "${px} ghauri -m '${cdir}/parameterized_urls.txt' --batch --random-agent -H 'User-Agent: ${ua}' -o '${vuln_dir}/ghauri_results.txt' ${pf:+--proxy '${pf}'}" "${raw}/ghauri.log" "GHAURI" &
+            run_live "ghauri -m '${cdir}/parameterized_urls.txt' --batch --random-agent -H 'User-Agent: ${ua}' -o '${vuln_dir}/ghauri_results.txt'" "${raw}/ghauri.log" "GHAURI" &
             register_batch_pid $!
         else
             log WARN "Ghauri skipped: ${cdir}/parameterized_urls.txt is missing or empty"
@@ -98,7 +101,7 @@ phase_vuln() {
         [[ ! -f "$wordlist" ]] && wordlist="/opt/seclists/Discovery/Web-Content/common.txt"
         if [[ -f "$wordlist" && -s "${cdir}/live_urls.txt" ]]; then
             job_limiter
-            run_live "head -n 20 '${cdir}/live_urls.txt' | xargs -P 5 -I {} bash -c '${px} ffuf -H \"User-Agent: ${ua}\" -u '\''{}'/FUZZ'\'' -w \"${wordlist}\" -mc 200,301,403 -t 50 -o \"${vuln_dir}\"/ffuf_{}$(date +%s).json ; rate_limit'" "${raw}/ffuf.log" "FFUF" &
+            run_live "head -n 20 '${cdir}/live_urls.txt' | xargs -P 5 -I {} bash -c 'ffuf -H \"User-Agent: ${ua}\" -u '\''{}'/FUZZ'\'' -w \"${wordlist}\" -mc 200,301,403 -t 50 -o \"${vuln_dir}\"/ffuf_{}$(date +%s).json ; rate_limit'" "${raw}/ffuf.log" "FFUF" &
             register_batch_pid $!
             rate_limit
         else
@@ -110,11 +113,16 @@ phase_vuln() {
     if tool_exists subjack; then
         log INFO "subjack \u2014 checking for unclaimed services with evasion..."
         CURRENT_TOOL="subjack"
-        # Fetch latest fingerprints
-        wget -q https://raw.githubusercontent.com/haccer/subjack/master/fingerprints.json -O /tmp/fingerprints_$$ 2>/dev/null
+        # §PERF: Use pre-cached fingerprints if available (set by initialize_pipeline)
+        local fp_file="${SUBJACK_FP_CACHE:-${BASE_DIR}/tmp/fingerprints.json}"
+        if [[ ! -s "$fp_file" ]]; then
+            wget -q --timeout=15 https://raw.githubusercontent.com/haccer/subjack/master/fingerprints.json \
+                -O "/tmp/fingerprints_$$" 2>/dev/null || true
+            fp_file="/tmp/fingerprints_$$"
+        fi
         job_limiter
         if [[ -s "${cdir}/all_subdomains.txt" ]]; then
-            run_live "${px} subjack -w '${cdir}/all_subdomains.txt' -t 100 -timeout 30 -o '${vuln_dir}/takeovers.txt' -ssl -c '/tmp/fingerprints_$$'" "${raw}/subjack.log" "SUBJACK" &
+            run_live "subjack -w '${cdir}/all_subdomains.txt' -t 100 -timeout 30 -o '${vuln_dir}/takeovers.txt' -ssl -c '${fp_file}'" "${raw}/subjack.log" "SUBJACK" &
             register_batch_pid $!
         else
             log WARN "Subjack skipped: ${cdir}/all_subdomains.txt missing or empty"

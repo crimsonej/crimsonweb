@@ -19,14 +19,19 @@ sanitize_target() {
 
 # Detect httpx binary (prefer Go-installed binary). Enforce -silent flag usage.
 detect_httpx() {
-    local hb
-    hb=$(command -v httpx 2>/dev/null || true)
-    if [[ -n "$hb" ]]; then
-        HTTPX_BIN="$hb"
-    else
-        local gopath
-        gopath=$(go env GOPATH 2>/dev/null || echo "${HOME}/go")
-        HTTPX_BIN="${gopath}/bin/httpx"
+    # If caller already forced HTTPX_BIN (e.g. global config), respect it.
+    if [[ -n "${HTTPX_BIN:-}" && -x "${HTTPX_BIN}" ]]; then
+        export HTTPX_BIN
+        return 0
+    fi
+
+    # Fallbacks (only used if global HTTPX_BIN not provided or not executable)
+    HTTPX_BIN=$(which httpx 2>/dev/null || true)
+    if [[ -z "$HTTPX_BIN" && -x "/usr/local/bin/httpx" ]]; then
+        HTTPX_BIN="/usr/local/bin/httpx"
+    fi
+    if [[ -z "$HTTPX_BIN" && -x "${HOME}/go/bin/httpx" ]]; then
+        HTTPX_BIN="${HOME}/go/bin/httpx"
     fi
     export HTTPX_BIN
 }
@@ -46,6 +51,9 @@ phase_analyze() {
     check_phase_tools "ANALYZE" subjs gf mantra trufflehog arjun || true
     section "PHASE 4: ANALYZE — Secrets & JS Analysis" "🔑"
     check_proxy
+
+    # Ensure standard phase directories exist
+    mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" 2>/dev/null || true
 
     local in_crawl="${TARGET_DIR}/CRAWL_results.txt"
     local js_list="${TARGET_DIR}/websites/js_urls.txt"
@@ -236,7 +244,7 @@ phase_analyze() {
         log INFO "Arjun — mining hidden parameters (system arjun) ..."
         CURRENT_TOOL="arjun"
         job_limiter
-        run_live "head -n 25 '$in_crawl' | xargs -P 5 -I {} arjun -u '{}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json'" "${raw}/arjun.log" "ARJUN" &
+        run_live "arjun -i '${in_crawl}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json'" "${raw}/arjun.log" "ARJUN" &
         register_batch_pid $!
     else
         # Attempt just-in-time installation via official repo (python tool)
@@ -253,7 +261,7 @@ phase_analyze() {
             log INFO "Running Arjun via python3 ${HOME}/tools/Arjun/arjun.py"
             CURRENT_TOOL="arjun"
             job_limiter
-            run_live "head -n 25 '$in_crawl' | xargs -P 5 -I {} python3 '${HOME}/tools/Arjun/arjun.py' -u '{}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json'" "${raw}/arjun.log" "ARJUN" &
+            run_live "python3 '${HOME}/tools/Arjun/arjun.py' -i '${in_crawl}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json'" "${raw}/arjun.log" "ARJUN" &
             register_batch_pid $!
         else
             log WARN "Arjun not available after JIT install; skipping parameter mining."

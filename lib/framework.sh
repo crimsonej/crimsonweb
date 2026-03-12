@@ -11,8 +11,10 @@ _wlog() {
     if [[ -n "${TARGET_DIR:-}" ]]; then
         local log_file="${TARGET_DIR}/logs/session.log"
         mkdir -p "$(dirname "$log_file")" 2>/dev/null
-        # Strip ANSI if possible, but for now just raw log
-        echo "[$timestamp] [$type] $msg" >> "$log_file"
+        # Strip ANSI escape sequences for clean file logging
+        local clean_msg
+        clean_msg=$(printf "%s" "$msg" | sed 's/\x1b\[[0-9;]*[mK]//g')
+        echo "[$timestamp] [$type] $clean_msg" >> "$log_file"
     fi
 }
 

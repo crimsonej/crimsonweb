@@ -35,7 +35,7 @@ master_cleanup() {
 
     # 2. Terminate tracked background workers
     log WARN "Master Cleanup: Terminating tracked processes..."
-    for pid in "${RUNNING_PIDS[@]:-}"; do
+    for pid in "${RUNNING_PIDS[@]}"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
         fi
@@ -98,6 +98,48 @@ path_fix() {
         local goos; goos=$(go env GOOS 2>/dev/null || echo "linux")
         local goarch; goarch=$(go env GOARCH 2>/dev/null || echo "amd64")
         export PATH="${go_bin}/${goos}_${goarch}:${PATH}"
+    fi
+}
+
+# Pre-flight tool check and self-healing installer
+check_tools() {
+    log INFO "Pre-flight: Verifying Go and Python toolchain and essential binaries..."
+
+    # Ensure Go-installed tools (best-effort; non-fatal)
+    if command -v go >/dev/null 2>&1; then
+        log INFO "Ensuring naabu and httpx Go binaries are installed (go install)"
+        (go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest 2>&1) || true
+        (go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest 2>&1) || true
+    fi
+
+    # Ensure Python httpx library is reasonably up-to-date (non-fatal)
+    if command -v pip3 >/dev/null 2>&1; then
+        pip3 install --upgrade httpx >/dev/null 2>&1 || true
+    elif command -v pip >/dev/null 2>&1; then
+        pip install --upgrade httpx >/dev/null 2>&1 || true
+    fi
+
+    # Validate ProjectDiscovery httpx binary path (PD_HTTPX); create symlink if possible
+    PD_HTTPX="${PD_HTTPX:-${HOME}/go/bin/httpx}"
+    if [[ ! -x "${PD_HTTPX}" ]]; then
+        local found
+        found=$(command -v httpx 2>/dev/null || true)
+        if [[ -n "$found" && -x "$found" ]]; then
+            log INFO "Found httpx at ${found}; attempting to symlink to ${PD_HTTPX} (best-effort, may require privileges)"
+            local pd_dir
+            pd_dir=$(dirname "${PD_HTTPX}")
+            if [[ ! -d "$pd_dir" ]]; then
+                mkdir -p "$pd_dir" 2>/dev/null || true
+            fi
+            ln -sf "$found" "${PD_HTTPX}" 2>/dev/null || true
+        else
+            log WARN "httpx binary not found in PATH and ${PD_HTTPX} not executable. Some probes may fail." 
+        fi
+    fi
+
+    # Attempt an automated sed patch for cloudkiller banner (best-effort)
+    if [[ -f "${HOME}/go/bin/cloudkiller" ]]; then
+        sed -i '56s/"/r"/' "${HOME}/go/bin/cloudkiller" 2>/dev/null || true
     fi
 }
 # ═══════════════════════════════════════════════════════════════════════════════

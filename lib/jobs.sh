@@ -14,7 +14,7 @@ job_limiter() {
             fi
         done
         (( running < max_jobs )) && break
-        sleep 1
+        sleep 0.5
     done
 }
 
@@ -39,27 +39,9 @@ run_live() {
     
     # Heartbeat: Start
     hb_log "$tag" "Launching ${WH}${tag}${RST}..."
-    # If a previous log exists, offer the operator a chance to redo and overwrite
-    if [[ -f "$log_file" && -s "$log_file" ]]; then
-        if [[ -t 0 ]]; then
-            read -r -p "[?] Log exists for ${tag} at ${log_file}. Redo and overwrite? [y/N]: " _redo
-            if [[ "${_redo}" =~ ^[Yy] ]]; then
-                : > "$log_file"
-                log INFO "Overwriting existing log: ${log_file}"
-            else
-                hb_log "$tag" "Skipping ${tag} (existing log preserved)."
-                # Print a short preview of existing findings for operator visibility
-                printf "  ${BCY}[${tag}] Existing findings preview:${RST}\n"
-                tail -n 20 "$log_file" 2>/dev/null | sed 's/^/    /'
-                return 0
-            fi
-        else
-            # Non-interactive: append by default
-            touch "$log_file"
-        fi
-    else
-        touch "$log_file"
-    fi
+    # If a previous log exists, do NOT prompt in background jobs — always truncate to provide a fresh log
+    # This avoids blocking background processes waiting for interactive input
+    : > "$log_file"
 
     # ── MAIN TOOL EXECUTION (Real-time streaming) ──
     # Stream output to BOTH terminal AND log file in real-time
@@ -85,17 +67,14 @@ run_live() {
 
     local count; count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
 
-    # Rate-limit / WAF detection: if logs show Cloudflare 1015 or 429, increase jitter and rotate proxy
-    if grep -E "1015|\b429\b|rate limit|error 1015|error 429|HTTP/1.[01] 403" "$log_file" >/dev/null 2>&1; then
+    # §PERF: Only scan last 20 lines for rate-limit signals — avoids full-file grep on 200K+ line logs
+    if tail -n 20 "$log_file" 2>/dev/null | grep -qE "1015|\b429\b|rate limit|error 1015|error 429|HTTP/1\.[01] 403"; then
         log WARN "Rate-limit detected in ${tag} output. Increasing jitter and rotating proxy..."
-        # Increase local jitter window
         export JITTER_MIN=3
         export JITTER_MAX=8
-        # Attempt simple proxy rotation if proxies enabled
         if [[ "${USE_PROXY:-false}" == "true" ]]; then
             proxy_prefix >/dev/null 2>&1 || true
         fi
-        # Sleep a random backoff between 3-8s
         sleep $((RANDOM % 6 + 3))
     fi
 
@@ -142,13 +121,22 @@ monitor_jobs() {
         
         local elapsed; elapsed=$(($(date +%s) - start_time))
         
-        # Live Stats for Loot
+        # §PERF: mtime-gated loot counting — only recount when log files have actually changed
         local cur_loot=0
+        local log_glob="${TARGET_DIR}/tools_used/"
         case "$phase" in
-            # §FIX: HUD Sync - Count from live raw files
-            RECON)   cur_loot=$(cat "${TARGET_DIR}/tools_used/"*.log 2>/dev/null | wc -l || echo 0) ;;
+            RECON|CRAWL)
+                # Find the most recent mtime across all logs
+                local newest_mtime; newest_mtime=$(find "${log_glob}" -name "*.log" -newer /tmp/.spw_loot_mtime_${phase} 2>/dev/null | head -1)
+                if [[ -n "$newest_mtime" || ! -f "/tmp/.spw_loot_count_${phase}" ]]; then
+                    cur_loot=$(cat "${log_glob}"*.log 2>/dev/null | wc -l || echo 0)
+                    echo "$cur_loot" > "/tmp/.spw_loot_count_${phase}"
+                    touch "/tmp/.spw_loot_mtime_${phase}"
+                else
+                    cur_loot=$(cat "/tmp/.spw_loot_count_${phase}" 2>/dev/null || echo 0)
+                fi
+                ;;
             SURFACE) cur_loot=$(wc -l < "${TARGET_DIR}/tools_used/httpx.log" 2>/dev/null || echo 0) ;;
-            CRAWL)   cur_loot=$(cat "${TARGET_DIR}/tools_used/"*.log 2>/dev/null | wc -l || echo 0) ;;
             VULNS)   cur_loot=$(find "${TARGET_DIR}/vulnerabilities" -type f -exec cat {} + 2>/dev/null | wc -l || echo 0) ;;
         esac
 
@@ -166,15 +154,17 @@ monitor_jobs() {
         hud_render "$running" "$cur_loot" "${CNT_VULNS:-0}" "$progress"
         
         local remote_skip=false
-        [[ -f /tmp/crimson_answer ]] && remote_skip=true
-        
-        if (read -r -t 1 -n 1 key && [[ -z "$key" ]]) || [[ "$remote_skip" == "true" ]]; then
-            log WARN "Skip Signal received. Terminating batch..."
-            rm -f /tmp/crimson_answer
-            for pid in "${running_pids[@]}"; do
-                kill -TERM "$pid" 2>/dev/null || true
+        [[ -f /tmp/crimson_skip ]] && remote_skip=true
+
+        # §FIX: Check for global ABORTED signal or explicit /skip command
+        if [[ "${ABORTED:-0}" == "1" ]] || [[ "$remote_skip" == "true" ]]; then
+            log WARN "Skip Signal received. Cleaning up current batch..."
+            # Terminate all PIDs in the current batch for immediate transition
+            for pid in "${CURRENT_BATCH_PIDS[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
             done
             CURRENT_BATCH_PIDS=()
+            rm -f /tmp/crimson_skip
             break
         fi
         sleep 0.5
@@ -205,7 +195,7 @@ progress_bar() {
 # Initialize error tracking
 export SENTRY_HEALTH_LOG="${TARGET_DIR}/logs/system_health.log"
 export SENTRY_ENABLED=true
-export -a FAILED_TOOLS=()
+declare -a FAILED_TOOLS=()
 export ENGINE_WARNING=false
 
 # Start the Silent Sentry monitoring loop
@@ -222,8 +212,8 @@ start_sentry() {
         # Failure keywords to grep for
         failure_keywords="error|connection refused|permission denied|invalid flag|timeout|failed|fatal|exception|crashed|segmentation"
         
-        while true; do
-            [[ ! -d "$target_dir/logs" ]] && { sleep 3; continue; }
+            while true; do
+            [[ ! -d "${target_dir}/logs" ]] && { sleep 3; continue; }
             
             # Scan all logs for failures
             for log_file in "$target_dir"/logs/*.log "$target_dir"/tools_used/*.log 2>/dev/null; do
@@ -267,7 +257,7 @@ tool_soft_restart() {
     
     # Modify command to use alternate proxy
     local restart_cmd="$original_cmd"
-    [[ -n "$alt_proxy" ]] && restart_cmd=$(echo "$restart_cmd" | sed "s|proxychains4.*|proxychains4 -f /tmp/proxy_alt_$$.conf|g")
+    [[ -n "$alt_proxy" ]] && restart_cmd=$(echo "$restart_cmd" | sed "s|proxychains4.*|proxychains4 -q -f /tmp/proxy_alt_$$.conf|g")
     
     # Execute restart
     local restart_log="/tmp/restart_${tool_name}_$$.log"

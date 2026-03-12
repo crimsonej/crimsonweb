@@ -39,7 +39,11 @@ process_high_alert_links() {
         local px; px=$(proxy_prefix)
         local pf; pf=$(proxy_flag)
         local ua; ua=$(ua_rand)
-        local HTTPX_BIN="$(command -v httpx || echo httpx)"
+        # Use the globally enforced HTTPX_BIN (set in crimsonweb.sh). Validate it's executable.
+        if [[ -z "${HTTPX_BIN:-}" || ! -x "${HTTPX_BIN}" ]]; then
+            echo "[-] Error: HTTPX_BIN (${HTTPX_BIN:-<unset>}) is not set or not executable. Skipping High Alert Pipeline."
+            return 1
+        fi
         local nuclei_out="${alert_dir}/.temp_nuclei_alerts.txt"
         
         spin_start "Scanning ${match_count} targets for active secrets..."

@@ -322,97 +322,55 @@ print_loot() {
 #  §3  LIVE LOG STREAMER (Real-time Output Merger)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Enhanced raw data live-feed with actual asset discovery
-stream_logs() {
-    local log_dir="${TARGET_DIR}/logs"
-    local tool_logs="${TARGET_DIR}/tools_used"
-    local data_files="${TARGET_DIR}/websites"
-    [[ ! -d "$log_dir" ]] && return
+# Start phase-specific log streaming targeting raw files
+start_phase_streamer() {
+    local phase="$1"
+    local file_pattern="$2"
+    [[ -z "$TARGET_DIR" || -z "$file_pattern" ]] && return
     
-    # Create named pipe for log streaming
-    local log_fifo="/tmp/log_stream_$$"
-    mkfifo "$log_fifo" 2>/dev/null || return
+    # Kill any existing streamer first
+    stop_phase_streamer
     
-    # Merge all active logs with LIVE INTEL display (actual discovered assets)
-    {
-        # Continuously tail all tool logs with type detection AND asset discovery
-        while true; do
-            if [[ -d "$tool_logs" ]]; then
-                # RECON phase: Show discovered subdomains in real-time
-                tail -f "$tool_logs"/subfinder.txt "$tool_logs"/assetfinder.txt "$tool_logs"/amass.txt 2>/dev/null | grep -v '^$' | head -5 | while read -r domain; do
-                    printf "  ${BCY}[RECON-LIVE]${RST} 🎯 Subdomain: ${WH}%s${RST}\n" "$domain" 2>/dev/null
-                done &
-                
-                # SURFACE phase: Show live/responsive hosts
-                [[ -f "$data_files/live_urls.txt" ]] && tail -f "$data_files/live_urls.txt" 2>/dev/null | grep -v '^$' | head -3 | while read -r url; do
-                    printf "  ${BYL}[SURFACE-LIVE]${RST} ✓ Live Target: ${WH}%s${RST}\n" "$url" 2>/dev/null
-                done &
-                
-                # CRAWL phase: Show discovered URLs/endpoints
-                [[ -f "$data_files/master_urls.txt" ]] && tail -f "$data_files/master_urls.txt" 2>/dev/null | grep -v '^$' | head -5 | while read -r endpoint; do
-                    printf "  ${BGR}[CRAWL-LIVE]${RST} 🔗 Endpoint: ${WH}%s${RST}\n" "$endpoint" 2>/dev/null
-                done &
-                
-                # VULN phase: Show vulnerabilities found
-                tail -f "$tool_logs"/nuclei.log 2>/dev/null | grep -iE 'matched|found|vulnerability' | head -3 | while read -r vuln; do
-                    printf "  ${BCR}[VULN-LIVE]${RST} ⚠️  Vulnerability: ${WH}%s${RST}\n" "$vuln" 2>/dev/null
-                done &
-                
-                # ANALYZE phase: Show secrets/credentials discovered
-                tail -f "$tool_logs"/mantra.log "$tool_logs"/trufflehog.log 2>/dev/null | grep -iE 'secret|key|credential|token|leak' | head -3 | while read -r secret; do
-                    printf "  ${BMAG}[ANALYZE-LIVE]${RST} 🔐 Credential: ${WH}%s${RST}\n" "$secret" 2>/dev/null
-                done &
-            fi
-            sleep 3
-            wait
-        done > "$log_fifo" 2>/dev/null
-    } &
-    
-    # Read from the fifo and display
-    timeout 0 cat "$log_fifo" 2>/dev/null &
-    rm -f "$log_fifo"
-}
-
-# Start log streaming in background
-start_log_stream() {
-    [[ -z "$TARGET_DIR" ]] && return
-    mkdir -p "${TARGET_DIR}/logs" 2>/dev/null
-    
-    # Launch log streaming in background (silent)
-    nohup bash -c '
-        log_dir="${TARGET_DIR:-/tmp}/tools_used"
-        while true; do
-            [[ ! -d "$log_dir" ]] && { sleep 2; continue; }
+    # Launch refined streamer targeting raw files
+    nohup bash -c "
+        echo -e \"\n  ${BCY}[${phase}-LIVE] Waiting for asset discovery...${RST}\"
+        tail -q -f $file_pattern 2>/dev/null | while read -r line; do
+            [[ -z \"\$line\" ]] && continue
+            [[ \"\$line\" =~ ^Processed|^Found|^Total|^\\[.*\\] ]] && continue
             
-            # Tail with type-specific formatting
-            tail -f "$log_dir"/*.log 2>/dev/null | while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                
-                # Detect tool type from filename context
-                if [[ "$line" =~ (subfinder|assetfinder|amass) ]]; then
-                    echo "[RECON-FLOW] $line"
-                elif [[ "$line" =~ (httpx|naabu) ]]; then
-                    echo "[SURFACE-PROBE] $line"
-                elif [[ "$line" =~ (katana|hakrawler|gau) ]]; then
-                    echo "[CRAWL-DATA] $line"
-                elif [[ "$line" =~ (nuclei|dalfox|ghauri) ]]; then
-                    echo "[VULN-PROBE] $line"
-                elif [[ "$line" =~ (mantra|trufflehog|subjs) ]]; then
-                    echo "[ANALYZE-DEEP] $line"
-                else
-                    echo "[TOOL-LOG] $line"
-                fi
-            done
-            sleep 1
+            if [[ \"$phase\" == \"RECON\" ]]; then
+                printf \"  ${BCY}[RECON-LIVE]${RST} 🎯 Subdomain: ${WH}%s${RST}\n\" \"\$line\"
+            elif [[ \"$phase\" == \"SURFACE\" ]]; then
+                printf \"  ${BYL}[SURFACE-LIVE]${RST} ✓ Live Target: ${WH}%s${RST}\n\" \"\$line\"
+            elif [[ \"$phase\" == \"CRAWL\" ]]; then
+                printf \"  ${BGR}[CRAWL-LIVE]${RST} 🔗 Endpoint: ${WH}%s${RST}\n\" \"\$line\"
+            elif [[ \"$phase\" == \"VULN\" ]]; then
+                printf \"  ${BCR}[VULN-LIVE]${RST} ⚠️  Vulnerability: ${WH}%s${RST}\n\" \"\$line\"
+            else
+                printf \"  ${DIM}[TOOL-LIVE]${RST} %s\n\" \"\$line\"
+            fi
         done
-    ' >> "${TARGET_DIR}/logs/streaming.log" 2>&1 &
+    " >> "${TARGET_DIR}/logs/streaming.log" 2>&1 &
     
-    export LOG_STREAM_PID=$!
+    export PHASE_STREAMER_PID=$!
 }
 
-# Stop log streaming
+# Stop the current phase streamer
+stop_phase_streamer() {
+    local pid="${PHASE_STREAMER_PID:-}"
+    if [[ -n "$pid" ]]; then
+        kill -9 "$pid" 2>/dev/null || true
+        unset PHASE_STREAMER_PID
+    fi
+}
+
+# Legacy wrapper for background compatibility
+start_log_stream() {
+    start_phase_streamer "SYSTEM" "${TARGET_DIR}/tools_used/*.log"
+}
+
 stop_log_stream() {
-    [[ -n "$LOG_STREAM_PID" ]] && kill -9 "$LOG_STREAM_PID" 2>/dev/null || true
+    stop_phase_streamer
 }
 
 # Print Final Session Report
@@ -446,13 +404,31 @@ print_final_report() {
     hrule '═' "$BCR"
 }
 
+# Stealthy Node Detection
+get_node_region() {
+    local providers=("https://ipapi.co/city" "https://ipinfo.io/city" "https://ifconfig.me/city")
+    local random_provider=${providers[$((RANDOM % ${#providers[@]}))]}
+    
+    # Fetch with stealth headers and a 5s timeout
+    local node_raw; node_raw=$(curl -s -A "${UA_STEALTH:-Mozilla/5.0}" --connect-timeout 5 "$random_provider" || echo "Unknown_Sector")
+    
+    # Sanitize: If the output contains HTML tags or JSON error markers (Cloudflare/Rate-limit), discard it
+    if [[ "$node_raw" == *"<html"* || "$node_raw" == *"{"* || "$node_raw" == *"status"* || -z "$node_raw" ]]; then
+        node_raw="Remote_Node"
+    fi
+    echo "$node_raw" | tr -d '[:space:]' | cut -c 1-20
+}
+
 print_welcome() {
-    # Lethality Welcome Screen - boxed
+    # Lethality Welcome Screen - boxed with dynamic node info and identity
+    local node_id; node_id=$(get_node_region)
+    local op_handle="${OPERATOR_NAME:-$(whoami)@$(hostname)}"
+    
     echo ""
     printf "  ${BCR}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RST}\n"
-    printf "  ${BCR}┃ ${BWHT}%-60s ${RST} ${BCR}┃${RST}\n" "[ STATUS ] System Arming..."
-    printf "  ${BCR}┃ ${BWHT}%-60s ${RST} ${BCR}┃${RST}\n" "[ ACCESS ] Authorized: Joachim Elijah"
-    printf "  ${BCR}┃ ${BWHT}%-60s ${RST} ${BCR}┃${RST}\n" "[ REGION ] Node: Kampala_East"
+    printf "  ${BCR}┃ ${BWHT}%-30s %-29s ${RST} ${BCR}┃${RST}\n" "[ STATUS ]" "OPERATIONAL / ONLINE"
+    printf "  ${BCR}┃ ${BWHT}%-30s %-29s ${RST} ${BCR}┃${RST}\n" "[ ACCESS ] Authorized:" "${op_handle:0:29}"
+    printf "  ${BCR}┃ ${BWHT}%-30s %-29s ${RST} ${BCR}┃${RST}\n" "[ REGION ] Node:" "${node_id}"
     printf "  ${BCR}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RST}\n"
     echo ""
 }

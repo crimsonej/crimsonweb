@@ -19,7 +19,6 @@ phase_recon() {
     fi
     CURRENT_PHASE="RECON"
     print_phase_map; print_loot
-
     # Check for existing results to resume/skip
     if [ -f "${TARGET_DIR}/${CURRENT_PHASE}_results.txt" ]; then
         printf "  ${BCY}[?]${RST} Existing data found for this phase. [S]kip to next phase, [R]e-scan, or [A]ppend new results? (15s timeout) "
@@ -37,14 +36,13 @@ phase_recon() {
 
     check_phase_tools "RECON" subfinder assetfinder amass || true
     section "PHASE 1: RECON — Subdomain Enumeration + Smart Diff Engine" "🔍"
-    check_c2; check_proxy
+    check_c2
 
     local rd="${TARGET_DIR}/websites"
     local raw="${TARGET_DIR}/tools_used"
     local all="${rd}/all_subdomains.txt"
     local hist="${rd}/subdomain_history.txt"
     local ua; ua=$(ua_rand)
-    local px; px=$(proxy_prefix)
     
     mkdir -p "$rd" "$raw"
     touch "$all" "$hist"
@@ -60,17 +58,18 @@ phase_recon() {
     done
     
     # Launch tools in background and register PIDs
+    start_phase_streamer "RECON" "${raw}/*.txt ${raw}/*.log"
     if tool_exists subfinder; then
         job_limiter
         check_c2
-        run_live "${px} subfinder -d '${TARGET}' -silent -t 150 -all -recursive -o '${raw}/subfinder.txt'" "${raw}/subfinder.log" "SUBFINDER" &
+        eval "subfinder -d '${TARGET}' -silent -t 150 -all -recursive -o '${raw}/subfinder.txt'" 2>&1 | tee -a "${raw}/subfinder.log" &
         register_batch_pid $!
         rate_limit  # Apply adaptive delay
     fi
 
     if tool_exists assetfinder; then
         job_limiter
-        run_live "${px} assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
+        run_live "assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
         register_batch_pid $!
         rate_limit
     fi
@@ -87,7 +86,7 @@ phase_recon() {
         mkdir -p "$raw"
         local amass_dir="/tmp/amass_session_$$"
         mkdir -p "$amass_dir"
-        run_live "${px} amass enum $amass_flags -d '${TARGET}' -dir '${amass_dir}' -o '${raw}/amass.txt'" "${raw}/amass.log" "AMASS" &
+        run_live "amass enum $amass_flags -d '${TARGET}' -dir '${amass_dir}' -o '${raw}/amass.txt'" "${raw}/amass.log" "AMASS" &
         register_batch_pid $!
         rate_limit
     fi
@@ -95,7 +94,7 @@ phase_recon() {
     if tool_exists gau; then
         job_limiter
         check_c2
-        run_live "${px} gau --subs --threads ${THREADS:-50} --timeout 30 --providers wayback,commoncrawl,otx '${TARGET}'" "${raw}/gau.log" "GAU" &
+        eval "gau --subs --threads ${THREADS:-50} --timeout 30 --providers wayback,commoncrawl,otx '${TARGET}'" 2>&1 | tee -a "${raw}/gau.log" &
         register_batch_pid $!
         # §FIX: Immediate High Alert Trigger
         process_high_alert_links "${raw}/gau.log" &
@@ -104,7 +103,7 @@ phase_recon() {
 
     if tool_exists waybackurls; then
         job_limiter
-        run_live "echo '${TARGET}' | ${px} waybackurls" "${raw}/wayback.log" "WAYBACK" &
+        run_live "echo '${TARGET}' | waybackurls" "${raw}/wayback.log" "WAYBACK" &
         register_batch_pid $!
         # §FIX: Immediate High Alert Trigger
         process_high_alert_links "${raw}/wayback.log" &
@@ -112,6 +111,7 @@ phase_recon() {
     fi
     
     monitor_jobs "RECON"
+    stop_phase_streamer
     
     # §FIX: Sort Safety
     [[ -s "${raw}/gau.log" ]] && sort -u "${raw}/gau.log" -o "${raw}/gau.log"
@@ -123,13 +123,14 @@ phase_recon() {
     # Stream inputs directly to avoid large in-memory variables
     {
         cat "${raw}/subfinder.txt" "${raw}/assetfinder.log" "${raw}/amass.txt" 2>/dev/null || true
+        # Extract purely domains from gau and waybackurls to avoid dropping thousands of hostnames
+        cat "${raw}/gau.log" "${raw}/wayback.log" 2>/dev/null | grep -Eo 'https?://[^/]+' | sed -e 's|^[^/]*://||' || true
     } | grep -v '*' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u > "${rd}/new_assets.txt"
 
     if tool_exists anew; then
         # Use anew if available for smart deduplication
         cat "${rd}/new_assets.txt" | anew "$all" > "${rd}/new_assets_added.txt" 2>/dev/null || {
-            # Fallback if anew fails
-            cat "${rd}/new_assets.txt" > "${rd}/new_assets.txt" 
+            # §FIX: Safe fallback — write to tmp first to avoid self-overwrite truncation
             cat "${rd}/new_assets.txt" >> "$all"
             sort -u -o "$all" "$all"
         }

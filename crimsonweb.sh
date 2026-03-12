@@ -11,8 +11,15 @@ export ABORTED=0
 export CLEANED=0
 
 # ── Global Constants ──────────────────────────────────────────────────────
+# Constants
 readonly VERSION="10.0"
 readonly VAULT_ROOT="CrimsonWeb_Vault"
+readonly UA_STEALTH="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+# Start the main recon pipeline (separated for audit->execution flow)
+start_recon_pipeline() {
+    # Delegate to main() to ensure a single unified entrypoint and avoid duplicate prompts
+    main "$@"
+}
 readonly TOOLS_DIR="${HOME}/.crimsonweb/bin"
 readonly TEMP_DIR="/tmp/.spw_$$"
 export INPUT_FIFO="/tmp/crimson_c2"
@@ -25,10 +32,12 @@ JITTER_MIN=1
 JITTER_MAX=3
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
+OPERATOR_NAME=""
 TELEGRAM_C2_STARTED=0
 USER_HEADER=""
 USE_PROXY=false
 MAX_JOBS=$(nproc 2>/dev/null || echo 4)
+[[ $MAX_JOBS -gt 4 ]] && MAX_JOBS=4
 
 # Counters
 CNT_SUBS=0; CNT_PORTS=0; CNT_URLS=0; CNT_JS=0; CNT_VULNS=0
@@ -37,26 +46,35 @@ CNT_SCREENSHOTS=0; HUD_PULSE="●"; CURRENT_PHASE="INIT"; CURRENT_TOOL=""
 START_EPOCH=$(date +%s)
 
 # ── Modular Sourcing (Order is Critical) ───────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${BASE_DIR}"
 
-source "${SCRIPT_DIR}/lib/ui.sh"            # Colors & Display
-source "${SCRIPT_DIR}/lib/framework.sh"     # Logging & Heartbeats
-source "${SCRIPT_DIR}/lib/utils.sh"         # Process & File Utils
-source "${SCRIPT_DIR}/lib/jobs.sh"          # Concurrency engine
-source "${SCRIPT_DIR}/lib/tg_c2.sh"         # Telegram & Input
-source "${SCRIPT_DIR}/lib/proxy.sh"         # Ghost Layer
-source "${SCRIPT_DIR}/lib/intelligence.sh"  # Initialization & IQ
+# Provide safe defaults so sourced libraries (which may run at load-time)
+# referencing `TARGET_DIR` or `TARGET` do not fail under `set -u`.
+export TARGET=""
+export TARGET_DIR="${BASE_DIR}/${VAULT_ROOT}"
+mkdir -p "${TARGET_DIR}" 2>/dev/null || true
+
+# --- [ CORE LIBRARIES ] ---
+source "${BASE_DIR}/lib/ansi.sh"       # HUD colors
+source "${BASE_DIR}/lib/utils.sh"      # Common utilities and ASCII tools
+source "${BASE_DIR}/lib/framework.sh"  # Core orchestration logic
+source "${BASE_DIR}/lib/jobs.sh"       # Job control and logging mechanisms
+source "${BASE_DIR}/lib/ui.sh"         # Centralized UI output logic
+source "${BASE_DIR}/lib/tg_c2.sh"      # Telegram C2 integration
+source "${BASE_DIR}/lib/intelligence.sh" # Vault management
 
 # Phase Modules
-source "${SCRIPT_DIR}/core/recon.sh"      # Phase 1
-source "${SCRIPT_DIR}/core/surface.sh"    # Phase 2
-source "${SCRIPT_DIR}/core/crawl.sh"      # Phase 3
-source "${SCRIPT_DIR}/core/analyze.sh"    # Phase 4
-source "${SCRIPT_DIR}/core/vulns.sh"      # Phase 5
-source "${SCRIPT_DIR}/core/high_alert.sh"  # Pipeline
+source "${BASE_DIR}/core/recon.sh"      # Phase 1
+source "${BASE_DIR}/core/surface.sh"    # Phase 2
+source "${BASE_DIR}/core/crawl.sh"      # Phase 3
+source "${BASE_DIR}/core/analyze.sh"    # Phase 4
+source "${BASE_DIR}/core/vulns.sh"      # Phase 5
+source "${BASE_DIR}/core/high_alert.sh"  # Pipeline
 
 export PATH="${HOME}/go/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:${HOME}/.local/bin"
-set -uo pipefail
+# Soft-fail mode: don't abort on non-zero commands; keep nounset checks
+set +e
 IFS=$'\n\t'
 
 # Register signal handlers: SIGINT -> manual abort, EXIT/TERM -> cleanup
@@ -70,293 +88,198 @@ manual_abort() {
 }
 
 trap manual_abort SIGINT
-trap master_cleanup EXIT TERM
+trap master_cleanup SIGTERM EXIT
+
+# Lightweight environment check — all version probes run in parallel
+check_environment() {
+    log PHASE "Auditing environment & dependencies..."
+    local tools=(naabu nmap httpx subfinder assetfinder amass gau curl jq python3 go git)
+
+    # §PERF: Run every version check in the background into tmp files
+    local tmp_dir; tmp_dir=$(mktemp -d /tmp/.spw_env_XXXXXX)
+    for t in "${tools[@]}"; do
+        (
+            local bin ver path_val
+            bin=$(command -v "$t" 2>/dev/null || true)
+            path_val=${bin:-"Not found"}
+            ver="Not found"
+            if [[ -n "$bin" ]]; then
+                ver=$("$bin" --version 2>&1 | head -n 1 2>/dev/null) \
+                    || ver=$("$bin" -V 2>&1 | head -n 1 2>/dev/null) \
+                    || ver=$("$bin" -v 2>&1 | head -n 1 2>/dev/null) \
+                    || true
+                ver=${ver:-"version unknown"}
+            fi
+            printf "| %-11s | %-40s | %s\n" "$t" "$path_val" "$ver" > "${tmp_dir}/${t}"
+        ) &
+    done
+    # Wait for all parallel probes to finish
+    wait
+
+    # Print header + results in original tool order
+    printf "| %-11s | %-40s | %s\n" "TOOL" "PATH" "VERSION" || true
+    printf "| %-11s | %-40s | %s\n" "----" "----------------------------------------" "-------" || true
+    for t in "${tools[@]}"; do
+        [[ -f "${tmp_dir}/${t}" ]] && cat "${tmp_dir}/${t}"
+    done
+    # Ensure we use the proper fallback default or an empty string
+    local target_ip=""
+    local ts; ts=$(date '+%H:%M:%S' 2>/dev/null || date +%T)
+    printf "[%s] [ %s ] SYS_MONITOR: ACTIVE\n" "$ts" "$HUD_PULSE" || true
+}
+
+# Initialization pipeline: best-effort setup and preflight
+initialize_pipeline() {
+    echo "--- [ SYSTEM INIT ] ---"
+    mkdir -p "${BASE_DIR}/tmp" 2>/dev/null || true
+    mkdir -p "${HOME}/go/bin" 2>/dev/null || true
+
+    # §PERF: Pre-cache Subjack fingerprints so vulns.sh doesn't block on GitHub at runtime
+    local fp_cache="${BASE_DIR}/tmp/fingerprints.json"
+    if [[ ! -s "$fp_cache" ]]; then
+        wget -q --timeout=15 \
+            https://raw.githubusercontent.com/haccer/subjack/master/fingerprints.json \
+            -O "$fp_cache" 2>/dev/null || true
+        [[ -s "$fp_cache" ]] && log OK "Subjack fingerprints cached to ${fp_cache}" || \
+            log WARN "Could not cache Subjack fingerprints (offline?); runtime fallback will be used."
+    else
+        log OK "Subjack fingerprints already cached."
+    fi
+    export SUBJACK_FP_CACHE="$fp_cache"
+
+    echo "--- [ INIT COMPLETE ] ---"
+}
+
+# Wrapper to launch all Telegram C2 services cleanly
+start_telegram_listener() {
+    [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || return 1
+    
+    # Launch services and record PIDs
+    telegram_listener >/dev/null 2>&1 &
+    register_pid $!
+    
+    ( while true; do tg_executor; sleep 0.5; done ) >/dev/null 2>&1 &
+    register_pid $!
+    
+    error_streamer >/dev/null 2>&1 &
+    register_pid $!
+    
+    TELEGRAM_C2_STARTED=1
+    export TELEGRAM_C2_STARTED
+    return 0
+}
 
 # ── Main Entry Point ──────────────────────────────────────────────────────
 main() {
-    path_fix
-    
-    # Initialize persistent HUD (ANSI escape codes)
-    hud_init
-    
-    # Initial UI setup
+    # Ensure a clean terminal and show ASCII logo / web art first
+    clear
     print_header
 
-    # Phase 1 (Input): Vault Setup (blocking, before any background PIDs)
-    local VAULT_DIR="${HOME}/.crimson_vault"
-    local VAULT_FILE="${VAULT_DIR}/vault.env"
-    if [[ -f "${VAULT_FILE}" ]]; then
-        local vault_abs
-        vault_abs=$(readlink -f "${VAULT_FILE}" 2>/dev/null || echo "${VAULT_FILE}")
-        printf "  🛡️  Vault located at: %s\n" "${vault_abs}"
-        if [[ -t 0 ]]; then
-            read -r -p "[?] Use existing Telegram credentials? [Y/n]: " use_existing
-            if [[ "${use_existing}" =~ ^[Nn] ]]; then
-                rm -f "${VAULT_FILE}" 2>/dev/null || true
-                unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TG_TOKEN TG_CHAT_ID
-                # Trigger setup wizard
-                read -r -p "Enter Telegram Bot Token: " _bot
-                read -r -p "Enter Telegram Chat ID: " _chat
-                mkdir -p "${VAULT_DIR}" 2>/dev/null || true
-                cat > "${VAULT_FILE}" <<EOF
-export TELEGRAM_BOT_TOKEN="${_bot}"
-export TELEGRAM_CHAT_ID="${_chat}"
-export TG_TOKEN="${_bot}"
-export TG_CHAT_ID="${_chat}"
-EOF
-                chmod 600 "${VAULT_FILE}" 2>/dev/null || true
-                log OK "Vault recreated at ${WH}${VAULT_FILE}${RST}"
-            fi
-        fi
-    else
-        if [[ -t 0 ]]; then
-            clear
-            printf "Vault not found. Run setup now? [y/N]: "
-            read -r _vault_enable
-            if [[ "${_vault_enable}" =~ ^[Yy] ]]; then
-                mkdir -p "${VAULT_DIR}" 2>/dev/null || true
-                read -r -p "Enter Telegram Bot Token: " _bot
-                read -r -p "Enter Telegram Chat ID: " _chat
-                cat > "${VAULT_FILE}" <<EOF
-export TELEGRAM_BOT_TOKEN="${_bot}"
-export TELEGRAM_CHAT_ID="${_chat}"
-export TG_TOKEN="${_bot}"
-export TG_CHAT_ID="${_chat}"
-EOF
-                chmod 600 "${VAULT_FILE}" 2>/dev/null || true
-                log OK "Vault created at ${WH}${VAULT_FILE}${RST}"
-            else
-                log INFO "Vault setup skipped by operator. Telegram C2 disabled unless env vars provided."
-            fi
-        fi
-    fi
+    # Step 1: Environment Audit and Pipeline Init
+    check_environment || true
+    initialize_pipeline || true
 
-    # Phase 2 (Network): Internet Heartbeat -> Proxy Swarm -> Print IPs
-    check_internet
+    # Step 2: Path and tool sanity
+    path_fix
+    check_tools || true
 
-    # Immediate C2 announcement so operator knows the bot is alive before target prompt
-    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-        tg_send "🛡️ *Crimson Sentinel Online*"
-        tg_send "🚀 *Crimson Web v${VERSION}* — C2 Active"
-    fi
-
-    # Visual pulse while proxy swarm initializes
-    spinner_start "Building Proxy Swarm"
-    proxy_load
-    check_proxy
-    spinner_stop
-
-    # Phase 3 (Background): Launch Tool Sync (silent)
-    bootstrap_system
-    
-    # if [[ $EUID -ne 0 ]]; then
-    #     printf "  ${BCR}[ERROR]${RST} This script requires root/sudo.\n"
-    #     exit 1
-    # fi
-    
-    parse_args "$@"
-    init_settings
-    init_high_alert_keywords
-
-    # Step 3: Setup/Load Vault (Telegram credentials)
-    local VAULT_DIR="${HOME}/.crimson_vault"
-    local VAULT_FILE="${VAULT_DIR}/vault.env"
-    if [[ -f "${VAULT_FILE}" ]]; then
-        # Source silently
-        # shellcheck source=/dev/null
-        source "${VAULT_FILE}" 2>/dev/null || true
-        log OK "Vault loaded from ${WH}${VAULT_FILE}${RST}"
-    else
-        if [[ -t 0 ]]; then
-            mkdir -p "${VAULT_DIR}" 2>/dev/null || true
-            echo "" && printf "Vault not found. Run setup now? [y/N]: "
-            read -r _vault_enable
-            if [[ "${_vault_enable}" =~ ^[Yy] ]]; then
-                read -r -p "Enter Telegram Bot Token: " _bot
-                read -r -p "Enter Telegram Chat ID: " _chat
-                cat > "${VAULT_FILE}" <<EOF
-export TELEGRAM_BOT_TOKEN="${_bot}"
-export TELEGRAM_CHAT_ID="${_chat}"
-export TG_TOKEN="${_bot}"
-export TG_CHAT_ID="${_chat}"
-EOF
-                chmod 600 "${VAULT_FILE}" 2>/dev/null || true
-                log OK "Vault created at ${WH}${VAULT_FILE}${RST} (permissions: 600)"
-                # shellcheck source=/dev/null
-                source "${VAULT_FILE}" 2>/dev/null || true
-            else
-                log INFO "Vault setup skipped by operator. Telegram C2 disabled unless env vars provided."
-            fi
-        fi
-    fi
-
-    # Initialize adaptive rate limiting based on proxy usage
-    set_adaptive_rate
-
-    # Show absolute vault path when available (helps operator locate credentials)
-    if [[ -f "${VAULT_FILE}" ]]; then
-        local vault_abs
-        vault_abs=$(readlink -f "${VAULT_FILE}" 2>/dev/null || echo "${VAULT_FILE}")
-        log OK "Vault path: ${WH}${vault_abs}${RST}"
-    fi
-    
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # CRITICAL: START TELEGRAM C2 LISTENER BEFORE TARGETING
-    # This ensures remote /target commands are captured during target input phase
-    # ═══════════════════════════════════════════════════════════════════════════════
-    
-    # Step 4: Start Telegram C2 Listener (pre-targeting) if credentials present
-    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-        log PHASE "🚀 Launching Telegram C2 Listener (pre-targeting)..."
-
-        # Start listener (creates FIFO) and register
-        telegram_listener >/dev/null 2>&1 &
-        register_pid $!
-
-        # Start executor loop immediately so C2 commands are actionable at startup
-        ( while true; do tg_executor; sleep 0.5; done ) >/dev/null 2>&1 &
-        register_pid $!
-        TELEGRAM_C2_STARTED=1
-        export TELEGRAM_C2_STARTED
-
-        log OK "C2 Listener active - ready for remote /target commands"
-
-        # C2 Heartbeat: verify connectivity and send strict handshake via curl
-        check_c2
-        # Prefer TG_TOKEN/TG_CHAT_ID exported by vault but fallback to TELEGRAM_* vars
-        TG_TOKEN="${TG_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}"
-        TG_CHAT_ID="${TG_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
-        if [[ -n "${TG_TOKEN}" && -n "${TG_CHAT_ID}" ]]; then
-            MSG="🕷️ Crimson Sentinel Online.%0A[Node]: Kampala_East%0A[Status]: System Arming..."
-            RESPONSE=$(curl -sS --connect-timeout 5 --max-time 15 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT_ID}" -d text="${MSG}" -d parse_mode="HTML") || RESPONSE=""
-            if [[ -z "${RESPONSE}" ]]; then
-                log ERROR "[!] Telegram handshake failed (network/connectivity)."
-                if [[ -t 0 ]]; then
-                    read -r -p "[?] Telegram handshake failed. Continue in SILENT MODE? [y/N]: " _cont
-                    if [[ ! "${_cont}" =~ ^[Yy] ]]; then
-                        log FATAL "Operator aborted due to Telegram handshake failure."
-                        exit 1
-                    else
-                        log WARN "Proceeding without Telegram C2 (silent mode)."
-                        TELEGRAM_C2_STARTED=0
-                    fi
-                fi
-            elif echo "${RESPONSE}" | grep -q '"error_code":403'; then
-                log ERROR "[!] Telegram API returned 403 Forbidden — the bot is likely blocked or user hasn't started it."
-                log ERROR "[!] ACTION REQUIRED: Open your Telegram Bot and click 'START' so it can send you notifications."
-                if [[ -t 0 ]]; then
-                    read -r -p "[?] Telegram is blocked. Continue without notifications? [y/N]: " _cont
-                    if [[ ! "${_cont}" =~ ^[Yy] ]]; then
-                        log FATAL "Operator aborted due to Telegram 403 Forbidden."
-                        exit 1
-                    else
-                        log WARN "Proceeding without Telegram C2 (silent mode)."
-                        TELEGRAM_C2_STARTED=0
-                    fi
-                fi
-            elif echo "${RESPONSE}" | grep -q '"ok":false'; then
-                log ERROR "[!] Telegram API Rejected the Token/Chat ID. Check credentials. Response: ${RESPONSE}"
-                if [[ -t 0 ]]; then
-                    read -r -p "[?] Credentials rejected. Continue in SILENT MODE? [y/N]: " _cont
-                    if [[ ! "${_cont}" =~ ^[Yy] ]]; then
-                        log FATAL "Operator aborted due to Telegram credential rejection."
-                        exit 1
-                    else
-                        log WARN "Proceeding without Telegram C2 (silent mode)."
-                        TELEGRAM_C2_STARTED=0
-                    fi
-                fi
-            else
-                log OK "Telegram handshake successful."
-            fi
-        else
-            log WARN "TG_TOKEN or TG_CHAT_ID not set; skipping strict handshake."
-        fi
-    fi
-    
-    # CRITICAL: Operator has total control over target input
-    # prompt_target now loops indefinitely with domain/IP validation
-    # Accepts: syfe.com, www.syfe.com, https://syfe.com/path, 192.168.1.1
-    [[ -z "$TARGET" ]] && prompt_target
-    
-    init_vault
-    
-    # §FIX: Mandatory Directory Initialization (Entry Point)
-    local TARGET_VAULT="CrimsonWeb_Vault/${TARGET}"
-    mkdir -p "$TARGET_VAULT/tools_used"
-    mkdir -p "$TARGET_VAULT/vulnerabilities"
-    mkdir -p "$TARGET_VAULT/screenshots"
-    mkdir -p "$TARGET_VAULT/raw"  # For raw intel discovery feed
-    touch "$TARGET_VAULT/RECON_results.txt"
-    
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # LAUNCH TELEGRAM BACKGROUND SERVICES (POST-TARGETING)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    
-    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-        # If executor not started at pre-target, start it now. Avoid duplicates.
-        if [[ -z "${TELEGRAM_C2_STARTED:-}" || "${TELEGRAM_C2_STARTED}" != "1" ]]; then
-            ( while true; do tg_executor; sleep 0.5; done ) >/dev/null 2>&1 &
-            register_pid $!
-            TELEGRAM_C2_STARTED=1
-            export TELEGRAM_C2_STARTED
-        fi
-
-        # Start error stream monitor (runs as background function)
-        error_streamer >/dev/null 2>&1 &
-        register_pid $!
-
-        # Verify C2 connectivity and announce availability
-        check_c2
-        tg_send "🚀 <b>Crimson Web v${VERSION} with 2-Way C2 Active</b>"
-        tg_send "📡 <b>C2 Commands Available:</b> /skip | /retry | /abort | /continue | /resume | /pause | /status"
-    fi
-    
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # ENABLE RAW INTEL STREAMING (Discovery Window)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    
-    # If raw intel directory exists, stream discoveries to terminal in background
-    if [[ -d "$TARGET_VAULT/raw" ]]; then
-        nohup bash -c "
-            echo \"\"
-            echo \"${BCY}[RAW INTEL STREAM] Waiting for asset discovery...${RST}\"
-            # Tail raw/* files continuously, showing new discovered assets
-            tail -f \"$TARGET_VAULT/raw\"/*.txt 2>/dev/null \\
-            | while IFS= read -r asset; do
-                [[ -z \"\$asset\" ]] && continue
-                # Skip bloat
-                [[ \"\$asset\" =~ ^Processed|^Found|^Total|^\\[.*\\] ]] && continue
-                
-                # Type detection
-                if [[ \"\$asset\" =~ \\.(api|dev|test|staging|backup|admin)\\. ]]; then
-                    echo \"  ${BCR}[SUBDOMAIN]${RST} ${WH}\$asset${RST}\"
-                elif [[ \"\$asset\" =~ ^https?:// ]]; then
-                    echo \"  ${BYL}[URL]${RST} ${WH}\$asset${RST}\"
-                elif [[ \"\$asset\" =~ ^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3} ]]; then
-                    echo \"  ${BGR}[IP]${RST} ${WH}\$asset${RST}\"
-                else
-                    echo \"  ${BCY}[ASSET]${RST} ${WH}\$asset${RST}\"
-                fi
-            done
-        " >> "$TARGET_VAULT/logs/discovery.log" 2>&1 &
-        register_pid $!
-    fi
-
-    # Step 5: Display System Audit Table
+    # Step 3: HUD + system audit
+    hud_init
     detect_system
     session_init
     cmd_setup
 
-    print_welcome # Shows the final splash before hunting
+    # Baseline arguments and settings
+    parse_args "$@"
+    init_settings
+    init_high_alert_keywords
+
+    # Step 4: Vault load (vault.env) to get Telegram credentials
+    local VAULT_DIR="${BASE_DIR}/${VAULT_ROOT}"
+    local VAULT_FILE="${VAULT_DIR}/vault.env"
+    if [[ -f "${VAULT_FILE}" ]]; then
+        source "${VAULT_FILE}" 2>/dev/null || true
+        log OK "Vault loaded: ${WH}${VAULT_FILE}${RST}"
+    fi
+
+    # Ensure OPERATOR_NAME has a safe default if not in vault
+    [[ -z "$OPERATOR_NAME" ]] && OPERATOR_NAME="$(whoami)@$(hostname)"
+
+    # --- C2 VAULT SELF-HEAL ---
+    if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+        printf "[%s] [ \033[1;33m!\033[0m ] Telegram credentials missing or corrupted.\n" "$(date +%T)"
+        printf "[%s] [ \033[1;33m!\033[0m ] Initiating Vault Self-Heal...\n" "$(date +%T)"
+        
+        mkdir -p "$(dirname "$VAULT_FILE")"
+        
+        # Prompt operator for missing keys and identity
+        read -r -p "   [>] Enter Operator Handle (Name): " INPUT_OP_NAME
+        read -r -p "   [>] Enter Telegram Bot Token: " INPUT_TOKEN
+        read -r -p "   [>] Enter Telegram Chat ID: " INPUT_CHAT_ID
+        
+        # Append to vault (create if missing)
+        echo "export OPERATOR_NAME=\"$INPUT_OP_NAME\"" >> "$VAULT_FILE"
+        echo "export TELEGRAM_BOT_TOKEN=\"$INPUT_TOKEN\"" >> "$VAULT_FILE"
+        echo "export TELEGRAM_CHAT_ID=\"$INPUT_CHAT_ID\"" >> "$VAULT_FILE"
+        echo "export TG_TOKEN=\"$INPUT_TOKEN\"" >> "$VAULT_FILE"
+        echo "export TG_CHAT_ID=\"$INPUT_CHAT_ID\"" >> "$VAULT_FILE"
+        
+        # Export for the immediate session
+        export OPERATOR_NAME="$INPUT_OP_NAME"
+        export TELEGRAM_BOT_TOKEN="$INPUT_TOKEN"
+        export TELEGRAM_CHAT_ID="$INPUT_CHAT_ID"
+        export TG_TOKEN="$INPUT_TOKEN"
+        export TG_CHAT_ID="$INPUT_CHAT_ID"
+        
+        printf "[%s] [ \033[1;32m●\033[0m ] Vault patched successfully. Resuming boot...\n" "$(date +%T)"
+        sleep 1
+    fi
+    # --------------------------
+
+    # Step 5: bootstrap_system in background
+    check_internet
+    bootstrap_system > /dev/null 2>&1 &
+    register_pid $!
+
+    # Step 6: Visible Telegram Handshake
+    printf "[%s] [ \033[1;33m○\033[0m ] Initializing Telegram C2 Bridge...\n" "$(date +%T)"
+
+    # Quick synchronous check to Telegram API
+    TG_CHECK=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" -m 5)
+
+    if echo "$TG_CHECK" | grep -q '"ok":true'; then
+        BOT_NAME=$(echo "$TG_CHECK" | jq -r '.result.username' 2>/dev/null || echo "Bot")
+        printf "[%s] [ \033[1;32m●\033[0m ] Telegram Bridge: ACTIVE (@%s)\n" "$(date +%T)" "$BOT_NAME"
+        
+        # Launch the listener cleanly in the background
+        start_telegram_listener > /dev/null 2>&1 &
+    else
+        printf "[%s] [ \033[1;31m!\033[0m ] Telegram Bridge: OFFLINE (Check Token/Network)\n" "$(date +%T)"
+    fi
+
+    sleep 1
+
+    # Step 7: prompt_target (or uses /tmp/crimson_answer if set via Telegram)
+    sleep 1
+    [[ -z "$TARGET" ]] && prompt_target
+    # Only send Telegram arming message if C2 is actually running
+    if [[ "${TELEGRAM_C2_STARTED:-0}" -eq 1 ]]; then
+        tg_send_msg "🚀 *CrimsonWeb Engine Armed* %0A🎯 Target: ${TARGET} %0A💻 Node: ${NODE_NAME:-Kampala_East}"
+    fi
+
+    # Step 8: init_vault → sets TARGET_DIR and creates standard dirs
+    init_vault
+    mkdir -p "${TARGET_DIR}/tools_used" "${TARGET_DIR}/vulnerabilities" "${TARGET_DIR}/screenshots" "${TARGET_DIR}/raw" 2>/dev/null || true
+    touch "${TARGET_DIR}/RECON_results.txt"
+
+    # Step 10: print_welcome
+    print_welcome
     log PHASE "Initiating Crimson Web modular operation on: ${WH}${TARGET}${RST}"
-    
-    # Skip RECON only when a non-empty live_urls.txt already exists in the target vault
+
+    # Step 11: Decide whether to skip / re-run RECON based on websites/live_urls.txt
     if [[ -d "${TARGET_DIR}" && -s "${TARGET_DIR}/websites/live_urls.txt" ]]; then
-        # Offer operator a force-rescan override (15s timeout). If no input, default to rescanning.
         if [[ -t 0 ]]; then
             read -t 15 -r -p "[?] Target data exists. Force fresh scan? [y/N]: " force_scan || true
-            # If no input (timeout) treat as affirmative (rescan)
             if [[ -z "$force_scan" || "$force_scan" =~ ^([yY][eE][sS]|[yY])$ ]]; then
                 log INFO "Force rescan requested. Purging existing target vault: ${TARGET_DIR}"
                 rm -rf "${TARGET_DIR}" || true
@@ -366,36 +289,37 @@ EOF
                 phase_complete "RECON" || true
             fi
         else
-            # Non-interactive environment: proceed to rescan by default
             log INFO "Non-interactive: forcing fresh scan (purging target vault)."
             rm -rf "${TARGET_DIR}" || true
             mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/vulnerabilities" 2>/dev/null || true
         fi
     fi
 
-    # If live_urls is now present and non-empty, skip; otherwise run RECON
+    # Step 12: Phase execution sequence
     if [[ -s "${TARGET_DIR}/websites/live_urls.txt" ]]; then
-        log SKIP "RECON — live_urls present and non-empty; skipping recon."
+        log SKIP "RECON — live_urls present and non-empty."
         phase_complete "RECON" || true
     else
         phase_recon
-
-        # Ensure recon has written outputs before starting surface
+        # Wait until live_urls.txt is non-empty before proceeding
         local wait_secs=0; local max_wait=30
         while [[ ! -s "${TARGET_DIR}/websites/live_urls.txt" && $wait_secs -lt $max_wait ]]; do
             sleep 1
             wait_secs=$((wait_secs+1))
         done
-        if [[ ! -s "${TARGET_DIR}/websites/live_urls.txt" ]]; then
-            log WARN "live_urls.txt still empty after recon (waited ${max_wait}s). Proceeding anyway."
-        else
-            # flush filesystem buffers
-            sync
-        fi
+        sync
     fi
 
     phase_surface
     phase_crawl
+    if [[ -x "${SCRIPT_DIR}/lib/deep_scan.sh" ]]; then
+        mkdir -p "${TARGET_DIR}" 2>/dev/null || true
+        nohup "${SCRIPT_DIR}/lib/deep_scan.sh" "$TARGET" "${TARGET_DIR}" > /dev/null 2>&1 &
+        register_pid $!
+    fi
+    if command -v crimson_gate_main >/dev/null 2>&1; then
+        crimson_gate_main || true
+    fi
     phase_analyze
     phase_vuln
     

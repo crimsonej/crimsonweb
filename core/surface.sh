@@ -2,6 +2,9 @@
 #  §PHASE 2 — SURFACE: Asset Validation & Surface Mapping
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Vault initialization is per-target; avoid creating hard-coded target vaults at source time
+# Per-target directories are created during phase execution using ${TARGET_DIR}
+
 # Ensure internal libraries are visible to the module
 LIB_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 source "$LIB_PATH/ui.sh"
@@ -9,7 +12,9 @@ source "$LIB_PATH/framework.sh"
 source "$LIB_PATH/utils.sh"
 source "$LIB_PATH/jobs.sh"
 source "$LIB_PATH/tg_c2.sh"
-source "$LIB_PATH/proxy.sh"
+
+# Force ProjectDiscovery httpx binary to avoid Python httpx collision
+PD_HTTPX="${PD_HTTPX:-${HOME}/go/bin/httpx}"
 
 phase_surface() {
     phase_should_run "SURFACE" || { log SKIP "SURFACE — already completed."; return; }
@@ -17,17 +22,29 @@ phase_surface() {
     print_phase_map
     
     check_phase_tools "SURFACE" naabu httpx cloudkiller nmap || true
+    # Ensure cloudkiller/subdomain helper file exists to avoid crashes
+    [ -f subl.txt ] || touch subl.txt
+    # Ensure SURFACE results file exists (avoid downstream missing file errors)
+    mkdir -p "${TARGET_DIR}" 2>/dev/null || true
+    touch "${TARGET_DIR}/SURFACE_results.txt"
     section "PHASE 2: SURFACE — Asset Validation & Surface Mapping" "🔌"
-    check_proxy
 
     local in_recon="${TARGET_DIR}/RECON_results.txt"
     local out="${TARGET_DIR}/websites"
     local raw="${TARGET_DIR}/tools_used"
     local vuln_dir="${TARGET_DIR}/vulnerabilities"
-    local px; px=$(proxy_prefix)
-    local pf; pf=$(proxy_flag)
     local ua; ua=$(ua_rand)
-    local HTTPX_BIN="${HOME}/go/bin/httpx"
+    # Use PD_HTTPX (ProjectDiscovery binary) when available; fallback to which
+    local HTTPX_BIN
+    if [[ -x "${PD_HTTPX}" ]]; then
+        HTTPX_BIN="${PD_HTTPX}"
+    else
+        HTTPX_BIN=$(which httpx 2>/dev/null || true)
+        if [[ -z "$HTTPX_BIN" && -x "${HOME}/go/bin/httpx" ]]; then
+            HTTPX_BIN="${HOME}/go/bin/httpx"
+        fi
+    fi
+    # Use the globally enforced HTTPX_BIN (set in crimsonweb.sh). If not executable, warn later.
     # Detect if TARGET is an IP (IPv4) to skip subdomain logic
     local IS_IP=false
     if [[ "$TARGET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -44,70 +61,100 @@ phase_surface() {
         fi
     done
 
-    # ----------------------- Tier 1: Passive Baseline Aggregation -----------------------
-    if tool_exists naabu; then
-        log INFO "naabu (Tier 1) — Passive baseline aggregation (no active probes)"
-        CURRENT_TOOL="naabu-passive"
-        job_limiter
-        # Use RECON results as source for passive metadata queries
-        run_live "${px} naabu -silent -passive -list '${in_recon}' -o '${raw}/naabu_passive.txt'" "${raw}/naabu_passive.log" "NAABU-PASSIVE" &
-        register_batch_pid $!
-        rate_limit
-    fi
+    # ----------------------- Tier 1: Discovery (naabu + assetfinder) -----------------------
+    mkdir -p "${TARGET_DIR}" "${raw}" "${out}" 2>/dev/null || true
+    local subs_file="${TARGET_DIR}/subs.txt"
+    rm -f "${raw}/naabu_passive.txt" "${raw}/assetfinder_subs.txt" 2>/dev/null || true
+    touch "${in_recon}" "${subs_file}"
 
-    # ----------------------- Tier 2: Low-Impact Active Verification --------------------
+    # Launch naabu (passive) and assetfinder in parallel
     if tool_exists naabu; then
-        log INFO "naabu (Tier 2) — Low-impact active verification (Top 1000 ports, throttled)"
-        CURRENT_TOOL="naabu-active"
-        job_limiter
-        # Input: prefer passive baseline if available, else fall back to recon list
-        local naabu_input="${raw}/naabu_passive.txt"
-        [[ ! -s "$naabu_input" ]] && naabu_input="${in_recon}"
-
-        # If target is an IP, scan the IP directly; otherwise scan list/top-1000
-        if [[ "$IS_IP" == true ]]; then
-            log INFO "Target detected as IP; scanning IP directly: ${TARGET}"
-            run_live "${px} naabu -top-1000 -rate 1000 -wait 1 -host '${TARGET}' -o '${out}/naabu_active_raw.txt'" "${raw}/naabu_active.log" "NAABU-ACTIVE" &
-        else
-            run_live "${px} naabu -top-1000 -rate 1000 -wait 1 -list '${naabu_input}' -o '${out}/naabu_active_raw.txt'" "${raw}/naabu_active.log" "NAABU-ACTIVE" &
-        fi
+        log INFO "naabu (passive) starting..."
+        run_live "naabu -silent -passive -list '${in_recon}' -o '${raw}/naabu_passive.txt'" "${raw}/naabu_passive.log" "NAABU_PASSIVE" &
         register_batch_pid $!
-        rate_limit
     fi
 
     if tool_exists assetfinder; then
-        log INFO "assetfinder — asset hunting with UA rotation..."
-        CURRENT_TOOL="assetfinder"
-        run_live "${px} assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
+        log INFO "assetfinder starting..."
+        run_live "assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
         register_batch_pid $!
-        rate_limit
-        # Save final results from log file after phase
     fi
 
-    # 2. HTTPX (Probing) - ENHANCED with UA rotation
-    if tool_exists httpx; then
-        log INFO "httpx — probing for status, titles, and fingerprints (UA rotation enabled)..."
-        CURRENT_TOOL="httpx"
-        hud_event "*" "Starting HTTPX validation on $(wc -l < "${in_recon}" 2>/dev/null || echo "?") targets..."
-        # Use long flags: -header for custom header, -silent instead of -s
-        local httpx_cmd="cat '${in_recon}' | xargs -P 20 -I {} ${px} ${HTTPX_BIN} -header \"User-Agent: ${ua}\" -silent --follow-redirects --timeout 15 -rl 30 -t 10 {}"
-        run_live "$httpx_cmd" "${raw}/httpx.log" "HTTPX" &
-        register_batch_pid $!
-        rate_limit
+    # Wait for discovery tools to finish
+    monitor_jobs "SURFACE_DISCO"
+
+    # Merge discovery outputs into subs.txt (ensure uniqueness)
+    cat "${raw}/assetfinder.log" "${raw}/naabu_passive.txt" "${in_recon}" 2>/dev/null | sed '/^\s*$/d' | sort -u > "${subs_file}" || true
+
+    # Fallback: if subs.txt empty, seed with TARGET
+    if [[ ! -s "${subs_file}" ]]; then
+        echo "${TARGET}" > "${subs_file}"
+        echo "[!] Asset discovery found nothing; force-seeded ${subs_file} with TARGET to continue" >&2
     fi
 
-    # 3. CLOUDKILLER (S3/Cloud check)
+    # Expose the loot: print discovered subdomains
+    echo -e "\n[\033[1;32m+\033[0m] \033[1;37mTARGETS ACQUIRED:\033[0m"
+    sed -n '1,200p' "${subs_file}" | sed 's/^/  -> /' || true
+
+    # ----------------------- Tier 2: Validation (httpx) -----------------------
+    local live_file="${TARGET_DIR}/live_hosts.txt"
+    rm -f "${live_file}" 2>/dev/null || true
+    touch "${live_file}" "${raw}/httpx.log"
+    
+    # Use the globally resolved HTTPX_BIN if available, otherwise fallback
+    local httpx_bin="${HTTPX_BIN:-${PD_HTTPX}}"
+    [[ ! -x "$httpx_bin" ]] && httpx_bin=$(command -v httpx 2>/dev/null || true)
+    
+    if [[ -n "${httpx_bin}" && -x "${httpx_bin}" ]]; then
+        log INFO "httpx validating subs (tech-detect active)..."
+        start_phase_streamer "SURFACE" "${live_file}"
+        run_live "'${httpx_bin}' -l '${subs_file}' -silent -sr -follow-redirects -tech-detect -status-code -timeout 15 -rl 30 -H 'User-Agent: ${ua}' -o '${live_file}'" "${raw}/httpx.log" "HTTPX_VALID" &
+        register_batch_pid $!
+    else
+        log WARN "httpx not available; treating subs as live hosts"
+        cp "${subs_file}" "${live_file}" 2>/dev/null || true
+    fi
+
+    monitor_jobs "SURFACE_VAL"
+    stop_phase_streamer
+
+    # Expose the live hosts
+
+    echo -e "\n[\033[1;32m+\033[0m] \033[1;37mLIVE HOSTS IDENTIFIED:\033[0m"
+    sed -n '1,200p' "${live_file}" | sed 's/^/  -> /' || true
+
+    # Persist validated live URLs into the target's websites directory
+    cp "${live_file}" "${out}/live_urls.txt" 2>/dev/null || echo "${TARGET}" > "${out}/live_urls.txt"
+
+    # ----------------------- Tier 3: Cloud Hunt (cloudkiller) -----------------------
+    local ck_out="${TARGET_DIR}/websites/cloud_results.txt"
+    local ck_log="${raw}/cloudkiller.log"
+    rm -f "${ck_out}" "${ck_log}" 2>/dev/null || true
+    touch "${ck_out}" "${ck_log}"
     if tool_exists cloudkiller; then
-        log INFO "cloudkiller — hunting for misconfigured cloud storage with evasion..."
-        CURRENT_TOOL="cloudkiller"
-        # Ensure cloudkiller (python) is invoked with python3 to avoid shell execution errors
-        local ck_path; ck_path=$(command -v cloudkiller 2>/dev/null || echo "${HOME}/tools/cloud-killer/cloud_killer.py")
-        run_live "python3 \"${ck_path}\" -d '${TARGET}'" "${raw}/cloudkiller.log" "CLOUDKILLER" &
-        register_batch_pid $!
-        rate_limit
+        log INFO "Launching Parallel Cloud Hunt (Timeout: 20s)..."
+        if [[ -s "${live_file}" ]]; then
+            while IFS= read -r host; do
+                [[ -f "/tmp/crimson_skip" ]] && { log WARN "Skip signal detected. Terminating Cloud Hunt."; break; }
+                [[ -z "${host}" ]] && continue
+                job_limiter
+                # Force non-interactive mode and sanitize banners
+                yes "" | timeout 20s python3 -W ignore "/root/go/bin/cloudkiller" <<< "${host}" 2>>"${ck_log}" | grep -vE '_____|From FD|Enter Target' >> "${TARGET_DIR}/websites/cloud_results.txt" &
+                register_batch_pid $!
+            done < "${live_file}"
+            monitor_jobs "SURFACE_CLOUD"
+        else
+            # fallback: run once against TARGET
+            yes "" | timeout 20s python3 -W ignore "/root/go/bin/cloudkiller" <<< "${TARGET}" 2>>"${ck_log}" | grep -vE '_____|From FD|Enter Target' >> "${TARGET_DIR}/websites/cloud_results.txt"
+        fi
+    else
+        echo "[!] cloudkiller not available; skipping cloud hunt" >> "${ck_log}"
     fi
 
-    monitor_jobs "SURFACE"
+    # Expose cloud results
+    echo -e "\n[\033[1;32m+\033[0m] \033[1;37mCLOUD FINDINGS:\033[0m"
+    sed -n '1,200p' "${ck_out}" | sed 's/^/  -> /' || true
+
     # Normalize naabu output into a simple open_ports list for downstream consumption
     if [[ -s "${out}/naabu_active_raw.txt" ]]; then
         awk -F':' '{print $1":"$2}' "${out}/naabu_active_raw.txt" 2>/dev/null | sort -u > "${out}/open_ports_raw.txt" || true
@@ -116,8 +163,14 @@ phase_surface() {
     
     # Consolidation (use raw logs as source)
     hud_event "*" "Consolidating SURFACE results..."
-    awk '{print $1}' "${raw}/httpx.log" 2>/dev/null | sort -u > "${out}/live_urls.txt"
-    sed 's|https\?://||; s|/.*||' "${raw}/httpx.log" 2>/dev/null | sort -u > "${out}/live_domains.txt"
+    # If live_file exists and is non-empty, use it for live_urls.txt
+    if [[ -s "${live_file}" ]]; then
+        cat "${live_file}" | sort -u > "${out}/live_urls.txt"
+    else
+        # Fallback to the TARGET if everything else failed
+        echo "${TARGET}" > "${out}/live_urls.txt"
+    fi
+    sed 's|https\?://||; s|/.*||' "${out}/live_urls.txt" 2>/dev/null | sort -u > "${out}/live_domains.txt"
 
     # Optional: keep copies for reference
     cp "${raw}/assetfinder.log" "${raw}/assetfinder.txt" 2>/dev/null || true
@@ -137,19 +190,35 @@ phase_surface() {
     fi
 
     if [[ -s "${out}/open_ports_raw.txt" && $(command -v nmap >/dev/null 2>&1; echo $?) -eq 0 ]]; then
-        log INFO "Tier 3: Launching targeted Nmap fingerprinting on discovered ports"
+        log INFO "Tier 3: Launching batched Nmap fingerprinting per host"
         CURRENT_TOOL="nmap"
+        declare -A HOST_PORTS=()
+        
         while IFS=":" read -r host port; do
             [[ -z "$host" || -z "$port" ]] && continue
+            HOST_PORTS["$host"]+="${port},"
+        done < "${out}/open_ports_raw.txt"
+
+        for host in "${!HOST_PORTS[@]}"; do
+            [[ -f "/tmp/crimson_skip" ]] && { log WARN "Skip signal detected. Terminating Nmap scan."; break; }
+            local ports="${HOST_PORTS[$host]%,}"
+            [[ -z "$ports" ]] && continue
             job_limiter
             local safe_host; safe_host=${host//\//_}
-            local out_file="${raw}/nmap_${safe_host}_${port}.txt"
-            # Use connect scan (-sT) to be compatible with SOCKS5 proxy layers
-            run_live "nmap -sT -sV -sC --version-intensity 5 -p ${port} -D RND:10 --source-port 53 ${host} -oN '${out_file}'" "${raw}/nmap_${safe_host}_${port}.log" "NMAP" &
+            local out_file="${raw}/nmap_${safe_host}.txt"
+            
+            # Use connect scan (-sT) as requested for speed/compat
+            local nmap_cmd="nmap -sT -sV -sC --version-intensity 3 -p ${ports} --open ${host} -oN '${out_file}'"
+            if sudo -n true 2>/dev/null; then
+                nmap_cmd="sudo ${nmap_cmd}"
+            fi
+            
+            # Execute in background and stream logs
+            eval "$nmap_cmd" 2>&1 | tee >(awk '{print "[\033[1;34mNMAP\033[0m] " $0}' >> "${raw}/nmap_${safe_host}.log") >/dev/null &
             register_batch_pid $!
-            rate_limit
-        done < "${out}/open_ports_raw.txt"
-        monitor_jobs "SURFACE-NMAP"
+        done
+        monitor_jobs "SURFACE_NMAP"
+        unset HOST_PORTS
     fi
     phase_complete "SURFACE"
 }

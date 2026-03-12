@@ -10,7 +10,7 @@ parse_args() {
         case "$1" in
             -d|--domain) TARGET="$2"; shift 2 ;;
             -t|--threads) THREADS="$2"; shift 2 ;;
-            --proxy) USE_PROXY=true; shift ;;
+            --force) FORCE_ALL=true; export FORCE_ALL=true; SKIP_PROMPTS=true; export SKIP_PROMPTS=true; shift ;;
             --help) print_help; exit 0 ;;
             *) shift ;;
         esac
@@ -32,7 +32,12 @@ init_settings() {
 # Vault Setup
 init_vault() {
     TARGET_SAFE="${TARGET//[^a-zA-Z0-9._-]/_}"
-    TARGET_DIR="${VAULT_ROOT}/${TARGET_SAFE}"
+    # Use absolute VAULT_PATH if provided, otherwise fall back to VAULT_ROOT
+    if [[ -n "${VAULT_PATH:-}" ]]; then
+        TARGET_DIR="${VAULT_PATH}/${TARGET_SAFE}"
+    else
+        TARGET_DIR="${VAULT_ROOT}/${TARGET_SAFE}"
+    fi
     
     # §FIX: Centralized Mandatory Directory Initialization
     echo -e "[*] Preparing target vault: ${BWHT}${TARGET_DIR}${RST}"
@@ -135,8 +140,85 @@ phase_should_run() {
     [[ -z "${TARGET_DIR:-}" ]] && return 0
     local marker_file="${TARGET_DIR}/.phase_${phase}.done"
     if [[ -f "$marker_file" ]]; then
-        # Phase already completed
-        return 1
+        # Phase already completed — ask operator whether to rerun (non-blocking)
+        # If FORCE_ALL is set, always re-run without prompting
+        if [[ "${FORCE_ALL:-false}" == "true" ]]; then
+            return 0
+        fi
+
+        printf "[?] %s already completed. Re-run? (y/N) — default Re-run in 20s: " "$phase"
+        local decision=""
+        local timeout_secs=20
+        local elapsed=0
+        local fifo="${INPUT_FIFO:-/tmp/crimson_c2}"
+
+        # Loop listening to both Telegram FIFO and local terminal input
+        while (( elapsed < timeout_secs )); do
+            # Check FIFO (Telegram) for actionable commands
+            if [[ -p "$fifo" ]]; then
+                if timeout 0.5 cat "$fifo" 2>/dev/null | head -1 | grep -q .; then
+                    local tf; tf=$(timeout 0.5 cat "$fifo" 2>/dev/null | head -1 2>/dev/null || true)
+                    tf=$(echo "$tf" | tr '[:upper:]' '[:lower:]' | xargs 2>/dev/null || true)
+                    if [[ "$tf" =~ ^(re_run|rerun|retry|y|yes)$ ]]; then
+                        decision="y"; break
+                    elif [[ "$tf" =~ ^(skip|s|n|no)$ ]]; then
+                        decision="n"; break
+                    elif [[ "$tf" =~ ^(abort|a)$ ]]; then
+                        decision="a"; break
+                    fi
+                fi
+            fi
+
+            # Check local terminal input (non-blocking)
+            if [[ -t 0 ]]; then
+                if read -r -t 1 -n 256 local_ans 2>/dev/null; then
+                    local_ans=$(echo "$local_ans" | tr '[:upper:]' '[:lower:]' | xargs 2>/dev/null || true)
+                    if [[ "$local_ans" =~ ^(y|yes|rerun|retry)$ ]]; then
+                        decision="y"; break
+                    elif [[ "$local_ans" =~ ^(n|no|skip)$ ]]; then
+                        decision="n"; break
+                    elif [[ "$local_ans" =~ ^(a|abort)$ ]]; then
+                        decision="a"; break
+                    fi
+                fi
+            fi
+
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+
+        # Default behavior if no decision received: default to Re-run (per strict repair)
+        if [[ -z "$decision" ]]; then
+            decision="y"
+        fi
+
+        case "$decision" in
+            y)
+                printf "\n[+] Operator selected: Re-run %s\n" "$phase"
+                # Purge existing target vault and marker so a fresh scan starts
+                if [[ -n "${TARGET_DIR:-}" ]]; then
+                    rm -rf "${TARGET_DIR}" 2>/dev/null || true
+                fi
+                if [[ -f "$marker_file" ]]; then
+                    rm -f "$marker_file" 2>/dev/null || true
+                fi
+                # Ensure subsequent phases run automatically without prompting
+                export FORCE_ALL=true
+                return 0
+                ;;
+            a)
+                printf "\n[!] Operator selected: Abort\n"
+                return 1
+                ;;
+            n)
+                printf "\n[-] Skipping %s (operator selected)\n" "$phase"
+                return 1
+                ;;
+            *)
+                printf "\n[-] Skipping %s (default action)\n" "$phase"
+                return 1
+                ;;
+        esac
     fi
     return 0
 }
