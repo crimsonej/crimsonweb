@@ -107,6 +107,15 @@ monitor_jobs() {
     local phase="$1"
     local start_time; start_time=$(date +%s)
     
+    # Normalize sub-phase labels so HUD treats SURFACE_* as SURFACE, etc.
+    local hud_phase="$phase"
+    case "$phase" in
+        SURFACE_*|SURFACE) hud_phase="SURFACE" ;;
+        RECON_*|RECON)     hud_phase="RECON"   ;;
+        CRAWL_*|CRAWL)     hud_phase="CRAWL"   ;;
+        VULNS_*|VULNS)     hud_phase="VULNS"   ;;
+    esac
+
     # §FIX: Monitor CURRENT_BATCH_PIDS array instead of generic 'jobs'
     while true; do
         local running_pids=()
@@ -124,16 +133,16 @@ monitor_jobs() {
         # §PERF: mtime-gated loot counting — only recount when log files have actually changed
         local cur_loot=0
         local log_glob="${TARGET_DIR}/tools_used/"
-        case "$phase" in
+        case "$hud_phase" in
             RECON|CRAWL)
                 # Find the most recent mtime across all logs
-                local newest_mtime; newest_mtime=$(find "${log_glob}" -name "*.log" -newer /tmp/.spw_loot_mtime_${phase} 2>/dev/null | head -1)
-                if [[ -n "$newest_mtime" || ! -f "/tmp/.spw_loot_count_${phase}" ]]; then
+                local newest_mtime; newest_mtime=$(find "${log_glob}" -name "*.log" -newer /tmp/.spw_loot_mtime_${hud_phase} 2>/dev/null | head -1)
+                if [[ -n "$newest_mtime" || ! -f "/tmp/.spw_loot_count_${hud_phase}" ]]; then
                     cur_loot=$(cat "${log_glob}"*.log 2>/dev/null | wc -l || echo 0)
-                    echo "$cur_loot" > "/tmp/.spw_loot_count_${phase}"
-                    touch "/tmp/.spw_loot_mtime_${phase}"
+                    echo "$cur_loot" > "/tmp/.spw_loot_count_${hud_phase}"
+                    touch "/tmp/.spw_loot_mtime_${hud_phase}"
                 else
-                    cur_loot=$(cat "/tmp/.spw_loot_count_${phase}" 2>/dev/null || echo 0)
+                    cur_loot=$(cat "/tmp/.spw_loot_count_${hud_phase}" 2>/dev/null || echo 0)
                 fi
                 ;;
             SURFACE) cur_loot=$(wc -l < "${TARGET_DIR}/tools_used/httpx.log" 2>/dev/null || echo 0) ;;
@@ -142,7 +151,7 @@ monitor_jobs() {
 
         # Calculate progress percentage (based on elapsed time as a proxy)
         local progress=0
-        case "$phase" in
+        case "$hud_phase" in
             RECON)   progress=$(( elapsed * 100 / 120 )) ;;
             SURFACE) progress=$(( elapsed * 100 / 180 )) ;;
             CRAWL)   progress=$(( elapsed * 100 / 240 )) ;;

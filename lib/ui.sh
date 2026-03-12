@@ -273,8 +273,10 @@ hud_render() {
     bar_str+="]"
     
     # Construct HUD line (lockable to bottom)
+    local tool="${CURRENT_TOOL:-idle}"
     local hud_line=""
     hud_line="${BCR}[PHASE: ${phase}]${RST} | "
+    hud_line+="${BCY}[Tool: ${tool}]${RST} | "
     hud_line+="${BCY}[Target: ${target}]${RST} | "
     hud_line+="${YL}Progress: ${bar_str} ${progress}%${RST} | "
     hud_line+="${BGR}[Live Jobs: ${jobs}]${RST} | "

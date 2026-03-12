@@ -70,12 +70,14 @@ phase_surface() {
     # Launch naabu (passive) and assetfinder in parallel
     if tool_exists naabu; then
         log INFO "naabu (passive) starting..."
+        CURRENT_TOOL="naabu-passive"
         run_live "naabu -silent -passive -list '${in_recon}' -o '${raw}/naabu_passive.txt'" "${raw}/naabu_passive.log" "NAABU_PASSIVE" &
         register_batch_pid $!
     fi
 
     if tool_exists assetfinder; then
         log INFO "assetfinder starting..."
+        CURRENT_TOOL="assetfinder"
         run_live "assetfinder --subs-only '${TARGET}'" "${raw}/assetfinder.log" "ASSETFINDER" &
         register_batch_pid $!
     fi
@@ -107,6 +109,7 @@ phase_surface() {
     
     if [[ -n "${httpx_bin}" && -x "${httpx_bin}" ]]; then
         log INFO "httpx validating subs (tech-detect active)..."
+        CURRENT_TOOL="httpx-validation"
         start_phase_streamer "SURFACE" "${live_file}"
         run_live "'${httpx_bin}' -l '${subs_file}' -silent -sr -follow-redirects -tech-detect -status-code -timeout 15 -rl 30 -H 'User-Agent: ${ua}' -o '${live_file}'" "${raw}/httpx.log" "HTTPX_VALID" &
         register_batch_pid $!
@@ -134,6 +137,7 @@ phase_surface() {
     if tool_exists cloudkiller; then
         log INFO "Launching Parallel Cloud Hunt (Timeout: 20s)..."
         if [[ -s "${live_file}" ]]; then
+            CURRENT_TOOL="cloudkiller"
             while IFS= read -r host; do
                 [[ -f "/tmp/crimson_skip" ]] && { log WARN "Skip signal detected. Terminating Cloud Hunt."; break; }
                 [[ -z "${host}" ]] && continue
@@ -220,5 +224,6 @@ phase_surface() {
         monitor_jobs "SURFACE_NMAP"
         unset HOST_PORTS
     fi
+    stop_phase_streamer
     phase_complete "SURFACE"
 }
