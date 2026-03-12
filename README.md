@@ -45,8 +45,8 @@ Bash
 ￼
 git clone https://github.com/crimsonej/crimsonweb.git
 cd crimsonweb
-chmod +x setup.sh crimsonweb.sh
-./setup.sh
+chmod +x  crimsonweb.sh
+./crimsonweb.sh
 3. Configuration
 Edit config/settings.conf to add your Telegram Bot Token and Chat ID to enable the C2 "High Alert" features.
 
