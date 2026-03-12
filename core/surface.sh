@@ -188,8 +188,12 @@ phase_surface() {
     cp "${raw}/assetfinder.log" "${raw}/assetfinder.txt" 2>/dev/null || true
     cp "${raw}/cloudkiller.log" "${out}/cloud_findings.txt" 2>/dev/null || true
     
-    CNT_PORTS=$(wc -l < "${out}/open_ports.txt" 2>/dev/null || echo 0)
-    CNT_URLS=$(wc -l < "${out}/live_urls.txt" 2>/dev/null || echo 0)
+    # Ensure open_ports.txt exists before trying to count it
+    touch "${out}/open_ports.txt" 2>/dev/null || true
+    CNT_PORTS=$(cat "${out}/open_ports.txt" 2>/dev/null | wc -l | awk '{print $1}')
+    CNT_PORTS=${CNT_PORTS:-0}
+    CNT_URLS=$(cat "${out}/live_urls.txt" 2>/dev/null | wc -l | awk '{print $1}')
+    CNT_URLS=${CNT_URLS:-0}
     
     hb_log "SURFACE" "Surface Mapping Complete: ${BGR}${CNT_URLS} live hosts${RST} and ${BGR}${CNT_PORTS} ports${RST} confirmed."
     hud_event "+" "Live URLs identified: ${CNT_URLS} targets validated"

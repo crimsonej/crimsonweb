@@ -183,6 +183,7 @@ main() {
     # Step 2: Path and tool sanity
     path_fix
     check_tools || true
+    check_all_tools
 
     # Step 3: HUD + system audit
     hud_init
@@ -245,18 +246,86 @@ main() {
     # Step 6: Visible Telegram Handshake
     printf "[%s] [ \033[1;33m○\033[0m ] Initializing Telegram C2 Bridge...\n" "$(date +%T)"
 
-    # Quick synchronous check to Telegram API
-    TG_CHECK=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" -m 5)
+    check_telegram_bridge() {
+        local status
+        # Initial silent check
+        status=$(curl -s -w "%{http_code}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" -o /dev/null -m 5)
 
-    if echo "$TG_CHECK" | grep -q '"ok":true'; then
-        BOT_NAME=$(echo "$TG_CHECK" | jq -r '.result.username' 2>/dev/null || echo "Bot")
-        printf "[%s] [ \033[1;32m●\033[0m ] Telegram Bridge: ACTIVE (@%s)\n" "$(date +%T)" "$BOT_NAME"
-        
-        # Launch the listener cleanly in the background
-        start_telegram_listener > /dev/null 2>&1 &
-    else
-        printf "[%s] [ \033[1;31m!\033[0m ] Telegram Bridge: OFFLINE (Check Token/Network)\n" "$(date +%T)"
-    fi
+        if [[ "$status" != "200" ]]; then
+            printf "[%s] [ \033[1;31m!\033[0m ] Telegram Bridge: OFFLINE (Status: $status)\n" "$(date +%T)"
+            
+            if [[ -t 0 ]]; then
+                # --- START SAFE PROMPT BLOCK ---
+                stop_control_listener 2>/dev/null || true
+                while read -r -t 0.1; do :; done # Flush buffer
+                stty sane 2>/dev/null
+                
+                echo -e "\n${YLW}[!] Telegram Connection Failed.${RST}"
+                echo -e "Options: [r]etry current, [n]ew token, [s]kip and continue"
+                
+                local choice
+                read -p "Selection [r/n/s]: " -n 1 -r choice < /dev/tty
+                echo -e "\n"
+
+                case "$choice" in
+                    n|N)
+                        local new_token new_id
+                        read -p "Enter New Telegram Token: " new_token < /dev/tty
+                        read -p "Enter New Chat ID: " new_id < /dev/tty
+                        
+                        # Update vault.env permanently
+                        if [[ -f "${VAULT_FILE}" ]]; then
+                            sed -i "s/TELEGRAM_BOT_TOKEN=.*/TELEGRAM_BOT_TOKEN=\"$new_token\"/" "${VAULT_FILE}"
+                            sed -i "s/TELEGRAM_CHAT_ID=.*/TELEGRAM_CHAT_ID=\"$new_id\"/" "${VAULT_FILE}"
+                            sed -i "s/TG_TOKEN=.*/TG_TOKEN=\"$new_token\"/" "${VAULT_FILE}"
+                            sed -i "s/TG_CHAT_ID=.*/TG_CHAT_ID=\"$new_id\"/" "${VAULT_FILE}"
+                        else
+                            mkdir -p "$(dirname "$VAULT_FILE")"
+                            echo "export TELEGRAM_BOT_TOKEN=\"$new_token\"" >> "$VAULT_FILE"
+                            echo "export TELEGRAM_CHAT_ID=\"$new_id\"" >> "$VAULT_FILE"
+                            echo "export TG_TOKEN=\"$new_token\"" >> "$VAULT_FILE"
+                            echo "export TG_CHAT_ID=\"$new_id\"" >> "$VAULT_FILE"
+                        fi
+                        
+                        export TELEGRAM_BOT_TOKEN="$new_token"
+                        export TELEGRAM_CHAT_ID="$new_id"
+                        export TG_TOKEN="$new_token"
+                        export TG_CHAT_ID="$new_id"
+                        
+                        printf "[%s] [ \033[1;34m*\033[0m ] Token updated. Retrying...\n" "$(date +%T)"
+                        check_telegram_bridge # Recursive retry
+                        return
+                        ;;
+                    r|R)
+                        printf "[%s] [ \033[1;34m*\033[0m ] Retrying with current token...\n" "$(date +%T)"
+                        check_telegram_bridge
+                        return
+                        ;;
+                    s|S|*)
+                        printf "[%s] [ \033[1;33m-\033[0m ] Proceeding securely without Telegram notifications.\n" "$(date +%T)"
+                        export TELEGRAM_ENABLED=false
+                        ;;
+                esac
+
+                start_control_listener 2>/dev/null || true
+                # --- END SAFE PROMPT BLOCK ---
+            fi
+        else
+            # Success Path
+            local tg_check bot_name
+            tg_check=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" -m 5)
+            bot_name=$(echo "$tg_check" | jq -r '.result.username' 2>/dev/null || echo "Bot")
+            
+            printf "[%s] [ \033[1;32m●\033[0m ] Telegram Bridge: ACTIVE (@%s)\n" "$(date +%T)" "$bot_name"
+            export TELEGRAM_ENABLED=true
+            
+            # Launch the listener cleanly in the background
+            start_telegram_listener > /dev/null 2>&1 &
+        fi
+    }
+
+    # Execute the interactive bridge validation
+    check_telegram_bridge
 
     sleep 1
 

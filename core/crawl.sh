@@ -82,19 +82,29 @@ phase_crawl() {
     # 1. Directory & Variable Initialization
     mkdir -p "$cdir" "$raw"
     local in_surface="${TARGET_DIR}/SURFACE_results.txt"
+    touch "$in_surface" 2>/dev/null || true
 
     # Fallback logic if SURFACE failed or was skipped
     if [[ ! -s "${in_surface}" ]]; then
         log WARN "SURFACE results missing; falling back to websites/live_urls.txt"
         in_surface="${TARGET_DIR}/websites/live_urls.txt"
+        touch "$in_surface" 2>/dev/null || true
     fi
     
     if [[ ! -s "${in_surface}" ]]; then
         log WARN "No validated URLs found; bootstrapping with TARGET: ${TARGET}"
-        echo "${TARGET}" > "${in_surface}"
+        echo "https://${TARGET}" > "${in_surface}"
     fi
 
-    log INFO "CRAWL: Seeding from $(wc -l < \"${in_surface}\" 2>/dev/null || echo \"0\") SURFACE-validated targets."
+    # Create a sanitized list of strict absolute URLs for crawlers
+    local valid_urls="${TARGET_DIR}/websites/valid_crawl_targets.txt"
+    grep -E '^https?://' "$in_surface" > "$valid_urls" 2>/dev/null || true
+    # If no absolute URLs found, prepend https:// to each line
+    if [[ ! -s "$valid_urls" ]]; then
+        sed 's|^|https://|' "$in_surface" > "$valid_urls" 2>/dev/null || true
+    fi
+
+    log INFO "CRAWL: Seeding from $(cat "${valid_urls}" 2>/dev/null | wc -l | awk '{print $1}') SURFACE-validated targets."
 
     # Display evasion status
     hud_event "*" "Crawl Phase: UA Rotation + Rate Limiting (${ADAPTIVE_DELAY}s delay) ACTIVE"
@@ -110,12 +120,12 @@ phase_crawl() {
     start_phase_streamer "CRAWL" "${raw}/*.txt"
     if tool_exists katana; then
         log INFO "Katana — Headless deep crawl with UA rotation (depth 6)..."
-        hud_event "*" "Starting Katana crawl on $(wc -l < \"${in_surface}\" 2>/dev/null || echo \"?\") targets..."
+        hud_event "*" "Starting Katana crawl on $(cat "${valid_urls}" 2>/dev/null | wc -l | awk '{print $1}') targets..."
         job_limiter
         local katana_log="${raw}/katana.log"
         local katana_out="${raw}/katana.txt"
         rm -f "${katana_log}" "${katana_out}" 2>/dev/null || true
-        run_live "katana -list '${in_surface}' -hl -d 6 -jc -kf all -c '${THREADS}'" "$katana_log" "KATANA" "$katana_out" &
+        run_live "katana -list '${valid_urls}' -hl -d 6 -jc -kf all -c '${THREADS}' -fr" "$katana_log" "KATANA" "$katana_out" &
         register_batch_pid $!
         rate_limit
     fi
@@ -126,7 +136,7 @@ phase_crawl() {
         local hak_log="${raw}/hakrawler.log"
         local hak_out="${raw}/hakrawler.txt"
         rm -f "${hak_log}" "${hak_out}" 2>/dev/null || true
-        run_live "cat '${in_surface}' | hakrawler -d 3" "$hak_log" "HAKRAWLER" "$hak_out" &
+        run_live "cat '${valid_urls}' | hakrawler -d 3" "$hak_log" "HAKRAWLER" "$hak_out" &
         register_batch_pid $!
         rate_limit
     fi
@@ -134,7 +144,7 @@ phase_crawl() {
     # 2. GAU & WAYBACKURLS (Historical/Passive)
     if tool_exists gau; then
         log INFO "gau — Passive URL harvest with evasion..."
-        hud_event "*" "Running GAU (passive discovery) on $(wc -l < \"${in_surface}\" 2>/dev/null || echo \"?\") domains..."
+        hud_event "*" "Running GAU (passive discovery) on $(cat "${valid_urls}" 2>/dev/null | wc -l | awk '{print $1}') domains..."
         job_limiter
         local gau_log="${raw}/gau.log"
         local gau_out="${raw}/gau.txt"

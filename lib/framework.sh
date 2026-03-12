@@ -76,6 +76,37 @@ check_phase_tools() {
     fi
 }
 
+# §NEW: Comprehensive toolchain audit (shows all status at boot)
+check_all_tools() {
+    log INFO "Operational Audit: Verifying framework toolchain status..."
+    local tools=(
+        "subfinder" "assetfinder" "amass" "httpx" 
+        "naabu" "nmap" 
+        "katana" "hakrawler" "gau" "waybackurls" 
+        "gf" "mantra" "trufflehog" "arjun" 
+        "nuclei" "dalfox" "ghauri" "ffuf" "subjack"
+    )
+    
+    local available=()
+    local missing=()
+    
+    # Auto-install arjun via pipx if missing
+    if ! command -v arjun &>/dev/null; then
+        install_arjun_jit 2>/dev/null || true
+    fi
+    
+    for t in "${tools[@]}"; do
+        if command -v "$t" &>/dev/null; then
+            available+=("${BGR}${t}${RST}")
+        else
+            missing+=("${BCR}${t}${RST}")
+        fi
+    done
+    
+    [[ ${#available[@]} -gt 0 ]] && log OK "Available Tools: ${available[*]}"
+    [[ ${#missing[@]} -gt 0 ]] && log WARN "Missing Tools: ${missing[*]}"
+}
+
 # ── Resource Management ────────────────────────────────────────────────────
 check_resources() {
     local tool="$1"

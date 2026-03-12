@@ -496,6 +496,32 @@ lazy_install_tool() {
     return 1
 }
 
+# Arjun Deep JIT Recovery Installer (pipx method for Parrot/Debian)
+install_arjun_jit() {
+    log WARN "Arjun missing. Installing via pipx..."
+
+    # 1. Ensure pipx is available (apt update first, exactly like manual install)
+    if ! command -v pipx &>/dev/null; then
+        sudo apt update -qq 2>/dev/null || true
+        sudo apt install -y pipx 2>/dev/null || true
+        pipx ensurepath 2>/dev/null || true
+        export PATH="$PATH:$HOME/.local/bin"
+    fi
+
+    # 2. Install arjun via pipx (creates its own venv + puts binary in ~/.local/bin)
+    pipx install arjun 2>/dev/null || true
+    export PATH="$PATH:$HOME/.local/bin"
+
+    # 3. Verify
+    if command -v arjun &>/dev/null; then
+        log OK "Arjun successfully installed via pipx."
+        return 0
+    else
+        log ERR "Arjun installation failed. Manual: sudo apt install -y pipx && pipx install arjun"
+        return 1
+    fi
+}
+
 # Universal environment bootstrap
 bootstrap_env() {
     local distro; distro=$(detect_distro)

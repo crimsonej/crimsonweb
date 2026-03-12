@@ -3,6 +3,14 @@
 #  §DEEP HUNT: HIGH ALERT SENSITIVE DATA PIPELINE (Modularized)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Ensure libraries are sourced for proxy_prefix, ua_rand, etc.
+source "$(dirname "$0")/../lib/utils.sh" 2>/dev/null || true
+
+# Locate HTTPX binary if not already set
+if [[ -z "${HTTPX_BIN:-}" ]]; then
+    export HTTPX_BIN=$(command -v httpx 2>/dev/null || echo "")
+fi
+
 process_high_alert_links() {
     local input_file="$1"
     local alert_dir="${TARGET_DIR}/HIGH_ALERTS"
@@ -21,6 +29,12 @@ process_high_alert_links() {
     # §FIX: Early return if input is missing or empty
     [[ ! -s "$input_file" ]] && return
 
+    # Verify HTTPX is available before proceeding
+    if [[ -z "${HTTPX_BIN:-}" || ! -x "${HTTPX_BIN}" ]]; then
+        log ERR "HTTPX not found in PATH. High Alert Pipeline aborted."
+        return 1
+    fi
+
     log INFO "High Alert Pipeline: Scanning for sensitive endpoints..."
 
     # 1. Deduplicate against history
@@ -36,29 +50,26 @@ process_high_alert_links() {
     log WARN "High Alert Pipeline: Found ${match_count} suspicious URLs. Probing..."
 
     if tool_exists httpx && tool_exists nuclei; then
-        local px; px=$(proxy_prefix)
-        local pf; pf=$(proxy_flag)
+        local px; px=$(proxy_prefix 2>/dev/null || echo "")
+        local pf; pf=$(proxy_flag 2>/dev/null || echo "")
         local ua; ua=$(ua_rand)
-        # Use the globally enforced HTTPX_BIN (set in crimsonweb.sh). Validate it's executable.
-        if [[ -z "${HTTPX_BIN:-}" || ! -x "${HTTPX_BIN}" ]]; then
-            echo "[-] Error: HTTPX_BIN (${HTTPX_BIN:-<unset>}) is not set or not executable. Skipping High Alert Pipeline."
-            return 1
-        fi
         local nuclei_out="${alert_dir}/.temp_nuclei_alerts.txt"
         
         spin_start "Scanning ${match_count} targets for active secrets..."
         mkdir -p "$alert_dir"
-        # §FIX: Ensure all URLs have protocol prefix before httpx processing
+
+        # §FIX: Normalize all URLs to absolute before httpx processing
         local httpx_raw="${alert_dir}/httpx_high_alert.log"
         local urls_with_protocol="${alert_dir}/.temp_urls_with_protocol.txt"
         sed -E 's|^([^/])|http://\1|; s|^http://http|http|; s|^http://https|https|' "$temp_filtered" > "$urls_with_protocol"
+
         # Preferred high-alert httpx flags: -silent -sc -title -cl -ct -location -fc 403
         run_live "cat '$urls_with_protocol' | xargs -I {} ${px} ${HTTPX_BIN} -header \"User-Agent: ${ua}\" -silent -sc -title -cl -ct -location -fc 403 -rl 30 -t 10 {}" "$httpx_raw" "HIGH-ALERT-HTTPX"
         grep -v "\[HIGH-ALERT-HTTPX\]" "$httpx_raw" | awk 'NF>1 {print $1}' > "${alert_dir}/.temp_targets.txt" || true
         
         if [[ -s "${alert_dir}/.temp_targets.txt" ]]; then
-            # Ensure nuclei templates are updated and template path provided
-            run_live "${px} nuclei -ut -t /root/nuclei-templates/ -l '${alert_dir}/.temp_targets.txt' -t exposures/ -t tokens/ -silent -o '${nuclei_out}' ${pf:+-proxy '${pf}'}" "${alert_dir}/nuclei_high_alert.log" "HIGH-ALERT-NUCLEI"
+            # §FIX: Removed trailing slashes from Nuclei -t paths
+            run_live "${px} nuclei -ut -t /root/nuclei-templates/ -l '${alert_dir}/.temp_targets.txt' -t exposures -t tokens -silent -o '${nuclei_out}' ${pf:+-proxy '${pf}'}" "${alert_dir}/nuclei_high_alert.log" "HIGH-ALERT-NUCLEI"
         fi
         spin_stop
         
@@ -67,7 +78,7 @@ process_high_alert_links() {
             while IFS= read -r line; do
                 printf "\n\033[5;31m  [☢️  HIGH ALERT ☢️ ] \033[0m\n"
                 printf "  ${BYL}Secret Discovered:${RST} ${line}\n"
-                tg_send "🚨 <b>HIGH PRIORITY ALERT</b> 🚨\n\nTarget: <code>${TARGET}</code>\nFound: <code>$(echo "$line" | cut -c1-100)...</code>"
+                tg_send "🚨 <b>HIGH PRIORITY ALERT</b> 🚨%0ATarget: <code>${TARGET}</code>%0AFound: <code>$(echo "$line" | cut -c1-100)...</code>" "ALERT"
             done < "$nuclei_out"
             rm -f "$nuclei_out"
         fi

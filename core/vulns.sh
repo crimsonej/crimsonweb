@@ -39,30 +39,31 @@ phase_vuln() {
 
     # 1. NUCLEI (Template Attack - ENHANCED: High-value templates targeting CVEs, exposed panels, takeovers)
     if tool_exists nuclei; then
-        log INFO "Nuclei \u2014 High-intensity community templates with evasion (CVEs, exposure, takeovers)..."
-        hud_event "*" "Starting Nuclei with stealth configuration on $(wc -l < \"${cdir}/live_urls.txt\" 2>/dev/null || echo \"?\") targets..."
+        log INFO "Nuclei — High-intensity community templates with evasion (CVEs, exposure, takeovers)..."
+        hud_event "*" "Starting Nuclei with stealth configuration on $(cat "${cdir}/live_urls.txt" 2>/dev/null | wc -l | awk '{print $1}') targets..."
         CURRENT_TOOL="nuclei"
         job_limiter
-        # Ensure nuclei templates are updated and template path provided
-        # Only run if input list exists and is non-empty
-        # Ensure websites folder & live_urls file exist to avoid "No such file" errors
-        mkdir -p "${TARGET_DIR}/websites/" 2>/dev/null || true
+        mkdir -p "${TARGET_DIR}/websites/" "${vuln_dir}" 2>/dev/null || true
         touch "${TARGET_DIR}/websites/live_urls.txt" 2>/dev/null || true
-        # Ensure the local LIVE_URLS dir exists in this shell before invoking Nuclei
-    # Ensure the input list is populated from the Surface/Crawl results
-    local live_urls_file="${cdir}/live_urls.txt"
-    if [[ ! -s "${live_urls_file}" ]]; then
-        log WARN "VULNS: live_urls.txt missing; falling back to SURFACE_results.txt"
-        cp "${TARGET_DIR}/SURFACE_results.txt" "${live_urls_file}" 2>/dev/null || true
-    fi
+        
+        # Ensure the input list is populated from the Surface/Crawl results
+        local live_urls_file="${cdir}/live_urls.txt"
+        if [[ ! -s "${live_urls_file}" ]]; then
+            log WARN "VULNS: live_urls.txt missing; falling back to SURFACE_results.txt"
+            cp "${TARGET_DIR}/SURFACE_results.txt" "${live_urls_file}" 2>/dev/null || true
+        fi
 
-    if [[ -s "${live_urls_file}" ]]; then
-        log INFO "VULNS: Seeding from $(wc -l < \"${live_urls_file}\" 2>/dev/null || echo \"0\") SURFACE-validated targets."
-        run_live "nuclei -t /root/nuclei-templates/ -l '${live_urls_file}' -H 'User-Agent: ${ua}' -t cves/ -t exposed-panels/ -t takeovers/ -t vulnerabilities/ -as -bulk-size 150 -c 50 -rl 300 -timeout 15 -o '${vuln_dir}/nuclei_results.json'" "${raw}/nuclei.log" "NUCLEI" &
-        register_batch_pid $!
-    else
-        log WARN "Nuclei skipped: No targets found in ${live_urls_file} or SURFACE_results.txt"
-    fi
+        if [[ ! -s "${live_urls_file}" ]]; then
+            log SKIP "No live URLs found to scan. VULNS phase cannot proceed effectively."
+        else
+            local total_targets
+            total_targets=$(wc -l < "${live_urls_file}" 2>/dev/null || echo 0)
+            export CNT_VULNS_TARGETS="$total_targets"
+            log INFO "VULNS: Seeding from ${total_targets} SURFACE-validated targets."
+            # Use -tags instead of -t for categories to avoid directory resolution errors
+            run_live "nuclei -t /root/nuclei-templates/ -l '${live_urls_file}' -H 'User-Agent: ${ua}' -tags cves,exposed-panels,takeovers,vulnerabilities -as -bulk-size 50 -rl 100 -timeout 15 -o '${vuln_dir}/nuclei_results.json'" "${raw}/nuclei.log" "NUCLEI" &
+            register_batch_pid $!
+        fi
         rate_limit
     fi
 
@@ -137,15 +138,28 @@ phase_vuln() {
     if [[ -f "${vuln_dir}/nuclei_results.json" ]]; then
         nuclei_count=$(grep -c '"template_id"' "${vuln_dir}/nuclei_results.json" 2>/dev/null || echo 0)
     else
-        nuclei_count=$(wc -l < "${vuln_dir}/nuclei_results.txt" 2>/dev/null || echo 0)
+        nuclei_count=$(cat "${vuln_dir}/nuclei_results.txt" 2>/dev/null | wc -l | awk '{print $1}')
     fi
+    # Sanitize: strip newlines and non-numeric chars
+    nuclei_count=$(echo "$nuclei_count" | tr -dc '0-9')
+    nuclei_count=${nuclei_count:-0}
     
     CNT_VULNS="$nuclei_count"
-    CNT_XSS=$(wc -l < "${vuln_dir}/dalfox_xss.txt" 2>/dev/null || echo 0)
+    local cnt_xss
+    cnt_xss=$(cat "${vuln_dir}/dalfox_xss.txt" 2>/dev/null | wc -l | awk '{print $1}')
+    cnt_xss=$(echo "$cnt_xss" | tr -dc '0-9')
+    cnt_xss=${cnt_xss:-0}
+    CNT_XSS="$cnt_xss"
     local total_vulns=$((CNT_VULNS + CNT_XSS))
     
     hb_log "VULNS" "Vuln Audit Complete: ${BCR}${total_vulns} vulnerabilities${RST} confirmed. (Templates: ${CNT_VULNS}, XSS: ${CNT_XSS})"
-    [[ $total_vulns -gt 0 ]] && tg_phase_summary "VULNS" "$TARGET" "$total_vulns" "$(($(date +%s) - PHASE_START_TIME))"
+    if [[ $total_vulns -gt 0 ]]; then
+        tg_phase_summary "VULNS" "$TARGET" "$total_vulns" "$(($(date +%s) - PHASE_START_TIME))"
+        # Fire ALERT-mode Telegram notification for critical findings
+        tg_send "<b>🔥 ${total_vulns} Vulnerabilities Confirmed</b>%0ATarget: <code>${TARGET}</code>%0ANuclei Templates: <code>${CNT_VULNS}</code>%0AXSS (Dalfox): <code>${CNT_XSS}</code>" "ALERT"
+    else
+        tg_send "✅ No critical vulnerabilities detected on ${CNT_VULNS_TARGETS:-unknown} targets." "INFO"
+    fi
     
     # Backup results
     cp "${vuln_dir}/nuclei_results.json" "${TARGET_DIR}/VULNS_results.json" 2>/dev/null || cp "${vuln_dir}/nuclei_results.txt" "${TARGET_DIR}/VULNS_results.txt" 2>/dev/null

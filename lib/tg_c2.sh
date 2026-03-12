@@ -69,36 +69,44 @@ tg_phase_summary() {
     tg_send "$summary"
 }
 
-# Unified HTML-based sender
+# Unified HTML-based sender with mode-based visual templates
 tg_send() {
     local msg="$1"
+    local mode="${2:-INFO}"  # INFO, ALERT, or SYSTEM
     [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]] && return
 
     local clean_token; clean_token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
     local clean_id; clean_id=$(echo "$TELEGRAM_CHAT_ID" | tr -d '[:space:]')
     local url="https://api.telegram.org/bot${clean_token}/sendMessage"
 
-    # Clean message: strip ANSI color codes using printf and robust regex
+    # Clean message: strip ANSI color codes
     local CLEAN_BODY
-    CLEAN_BODY=$(printf "%b" "$1" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
+    CLEAN_BODY=$(printf "%b" "$msg" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
 
-    # Prefix header with Node IP (HTML safe) and assemble final message (use URL-encoded newlines)
-    local CURRENT_IP
-    # Suppress curl stderr (network errors) to avoid noisy messages in the terminal
-    CURRENT_IP=$(curl -s "${TELEGRAM_CURL_OPTS[@]}" ${CURL_OPTS[@]} http://ifconfig.me 2>/dev/null || echo "unknown")
-    local HEADER
-    HEADER="<b>🌍 [Node]:</b> <code>${CURRENT_IP}</code>"
-    local FINAL_MESSAGE
-    FINAL_MESSAGE="${HEADER}%0A%0A${CLEAN_BODY}"
+    # Mode-based icon/header
+    local icon
+    case "$mode" in
+        ALERT)  icon="🔥 <b>[CRITICAL FINDING]</b>" ;;
+        SYSTEM) icon="⚙️ <b>[SYSTEM]</b>" ;;
+        *)      icon="🌐 <b>[NODE]</b>" ;;
+    esac
 
-    # Perform a strict POST with short timeouts and capture response for diagnostics (HTML mode)
+    # Resolve Node IP (cached for session to avoid repeated lookups)
+    if [[ -z "${_CACHED_NODE_IP:-}" ]]; then
+        _CACHED_NODE_IP=$(curl -s "${TELEGRAM_CURL_OPTS[@]}" http://ifconfig.me 2>/dev/null || echo "unknown")
+        export _CACHED_NODE_IP
+    fi
+
+    # Assemble high-fidelity sentinel message
+    local FINAL_MESSAGE="${icon} <code>${_CACHED_NODE_IP}</code>%0A━━━━━━━━━━━━━━━%0A${CLEAN_BODY}"
+
+    # Perform a strict POST with short timeouts (HTML mode)
     local resp
-        resp=$(curl -s "${TELEGRAM_CURL_OPTS[@]}" ${CURL_OPTS[@]} -X POST "$url" \
-            -d "chat_id=${clean_id}" \
-            --data-urlencode "text=${FINAL_MESSAGE}" \
-            -d "parse_mode=HTML") || {
-        log WARN "Telegram send failed: network/connectivity error (logged to fallback)"
-        # §FIX: Echo Fallback for local logging when curl fails
+    resp=$(curl -s "${TELEGRAM_CURL_OPTS[@]}" -X POST "$url" \
+        -d "chat_id=${clean_id}" \
+        --data-urlencode "text=${FINAL_MESSAGE}" \
+        -d "parse_mode=HTML") || {
+        # Fallback for local logging when curl fails
         mkdir -p "${TARGET_DIR:-/tmp}/logs" 2>/dev/null
         printf "[%s] [TELEGRAM_FAIL] %s\n" "$(date +%Y-%m-%d\ %H:%M:%S)" "$CLEAN_BODY" >> "${TARGET_DIR:-/tmp}/logs/tg_fallback.log"
         return 1
@@ -106,7 +114,6 @@ tg_send() {
 
     # Inspect API response
     if echo "$resp" | grep -q '"ok":true'; then
-        hb_log "C2" "Telegram message delivered"
         return 0
     else
         log WARN "Telegram API error: ${resp}"
@@ -114,9 +121,27 @@ tg_send() {
     fi
 }
 
-# Aliases for backward compatibility and user-facing scripts
+# Backward-compatible wrappers (old callers pass 1 arg)
 send_telegram() { tg_send "$@"; }
 tg_send_msg() { tg_send "$@"; }
+
+# System telemetry for /status command
+get_sys_info() {
+    local ram cpu bat loc
+    ram=$(free -m 2>/dev/null | awk '/Mem:/ { printf("%3.1f%%", $3/$2*100) }' || echo "N/A")
+    cpu=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{printf "%.1f%%", $2 + $4}' || echo "N/A")
+    bat=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null || echo "N/A")
+    loc=$(curl -s --max-time 3 https://ipapi.co/json/ 2>/dev/null | jq -r '.city + ", " + .country_name' 2>/dev/null || echo "Unknown")
+    
+    if [[ -z "${_CACHED_NODE_IP:-}" ]]; then
+        _CACHED_NODE_IP=$(curl -s http://ifconfig.me 2>/dev/null || echo "unknown")
+        export _CACHED_NODE_IP
+    fi
+
+    echo "🛰 <b>Phase:</b> ${CURRENT_PHASE:-INIT}%0A🔋 <b>Battery:</b> ${bat}%%0A🧠 <b>RAM:</b> ${ram}%0A⚡ <b>CPU:</b> ${cpu}%0A📍 <b>Loc:</b> ${loc}%0A🌐 <b>IP:</b> ${_CACHED_NODE_IP}"
+}
+
+# (send_telegram and tg_send_msg aliases are now defined directly after tg_send above)
 
 tg_send_file() {
     local file_path="$1"
@@ -319,42 +344,41 @@ tg_executor() {
         
         case "$cmd" in
             skip)
-                tg_send "⏭️  Skipped current phase."
+                tg_send "⏭ Phase skip command received." "SYSTEM"
                 touch /tmp/crimson_skip
                 log PHASE "C2: SKIP command executed"
                 ;;
             retry)
-                tg_send "🔄 Retrying current phase."
+                tg_send "🔄 Retrying current phase." "SYSTEM"
                 log PHASE "C2: RETRY command executed"
                 ;;
             abort)
-                tg_send "🛑 Aborted scan. Cleaning up..."
+                tg_send "🛑 Aborted scan. Cleaning up..." "SYSTEM"
                 log FATAL "C2: ABORT command - terminating"
                 exit 1
                 ;;
             continue)
-                tg_send "▶️  Continuing to next phase."
+                tg_send "▶️  Continuing to next phase." "SYSTEM"
                 log PHASE "C2: CONTINUE command executed"
                 ;;
             pause)
-                tg_send "⏸️  Scan paused."
+                tg_send "⏸️  Scan paused." "SYSTEM"
                 log WARN "C2: PAUSE command"
                 ;;
             resume)
-                tg_send "▶️  Scan resumed."
+                tg_send "▶️  Scan resumed." "SYSTEM"
                 log PHASE "C2: RESUME command"
                 ;;
             logs)
-                # Send last 10 lines of /tmp/crimson_sync.log
                 local logs; logs=$(_tail 10 /tmp/crimson_sync.log 2>/dev/null || echo "No logs available")
-                tg_send "*Last 10 lines of /tmp/crimson_sync.log*\n\n\`\`\`${logs}\n\`\`\`"
+                tg_send "<b>Last 10 Log Lines:</b>%0A<code>${logs}</code>" "SYSTEM"
                 ;;
             websites)
                 local livef="${TARGET_DIR}/websites/live_urls.txt"
                 if [[ -f "$livef" && -s "$livef" ]]; then
                     tg_send_file "$livef" "Live URLs for ${TARGET}"
                 else
-                    tg_send "ℹ️ No live URLs found yet."
+                    tg_send "ℹ️ No live URLs found yet." "INFO"
                 fi
                 ;;
             vulns)
@@ -365,24 +389,42 @@ tg_executor() {
                     if [[ -f "$tarf" ]]; then
                         tg_send_file "$tarf" "Vulnerabilities for ${TARGET}" && rm -f "$tarf"
                     else
-                        tg_send "ℹ️ No vulnerability artifacts to send."
+                        tg_send "ℹ️ No vulnerability artifacts to send." "INFO"
                     fi
                 else
-                    tg_send "ℹ️ Vulnerabilities directory not present."
+                    tg_send "ℹ️ Vulnerabilities directory not present." "INFO"
                 fi
                 ;;
             stop)
-                tg_send "🛑 Stop signal received. Terminating current operations..."
+                tg_send "🛑 Stop signal received. Terminating current operations..." "SYSTEM"
                 touch /tmp/crimson_stop
                 log PHASE "C2: STOP signal issued"
                 ;;
             status)
-                local phase="${CURRENT_PHASE:-INIT}"
-                local target="${TARGET:-none}"
-                tg_send "📊 <b>Status Report</b>\\nPhase: ${phase}\\nTarget: ${target}"
+                local stats
+                stats=$(get_sys_info)
+                tg_send "$stats" "SYSTEM"
+                ;;
+            help)
+                tg_send "<b>Available Commands:</b>%0A/status — System Health%0A/shot — Terminal Screenshot%0A/skip — Skip Current Phase%0A/stop — Kill Active Scan%0A/logs — Last 10 Log Lines%0A/websites — Send Live URLs%0A/vulns — Send Vuln Archive%0A/target <domain> — Set Target%0A/help — This Menu" "SYSTEM"
+                ;;
+            shot)
+                if command -v scrot &>/dev/null; then
+                    scrot "/tmp/crimson_shot.png" 2>/dev/null || true
+                    if [[ -f "/tmp/crimson_shot.png" ]]; then
+                        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+                            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+                            -F "photo=@/tmp/crimson_shot.png" \
+                            -F "caption=📸 Current Terminal State" > /dev/null 2>&1
+                        rm -f "/tmp/crimson_shot.png"
+                    else
+                        tg_send "❌ Screenshot capture failed." "SYSTEM"
+                    fi
+                else
+                    tg_send "❌ scrot not installed. Run: sudo apt install scrot" "SYSTEM"
+                fi
                 ;;
             *)
-                # Unknown command - log it
                 [[ -n "$cmd" ]] && log WARN "C2: Unknown command: ${cmd}"
                 ;;
         esac
@@ -504,17 +546,31 @@ telegram_listener() {
                     continue
                 fi
 
-                # Explicitly handle /help and /status as requested
+                # Explicitly handle /help, /status, and /shot inline
                 if [[ "$msg" == "/help" ]]; then
-                    tg_send "🤖 <b>CrimsonWeb C2 Active</b>\n/target <domain> - Start scan\n/status - Show current phase\n/abort - Kill scan\n/skip - Skip phase"
+                    tg_send "<b>Available Commands:</b>%0A/status — System Health%0A/shot — Terminal Screenshot%0A/skip — Skip Current Phase%0A/stop — Kill Active Scan%0A/logs — Last 10 Log Lines%0A/websites — Send Live URLs%0A/vulns — Send Vuln Archive%0A/target <domain> — Set Target%0A/help — This Menu" "SYSTEM"
                     continue
                 elif [[ "$msg" == "/status" ]]; then
-                    local phase="${CURRENT_PHASE:-Waiting for target}"
-                    tg_send "📊 <b>Status:</b> Running Phase: $phase"
-                    
-                    # Also write 'status' to FIFO so the main executor can reply with full details
-                    if [[ -t 3 ]] || true; then
-                        printf "status\n" >&3 2>/dev/null || true
+                    local stats
+                    stats=$(get_sys_info)
+                    tg_send "$stats" "SYSTEM"
+                    continue
+                elif [[ "$msg" == "/shot" ]]; then
+                    if command -v scrot &>/dev/null; then
+                        scrot "/tmp/crimson_shot.png" 2>/dev/null || true
+                        if [[ -f "/tmp/crimson_shot.png" ]]; then
+                            local c_token; c_token=$(echo "$TELEGRAM_BOT_TOKEN" | tr -d '[:space:]')
+                            local c_chatid; c_chatid=$(echo "$TELEGRAM_CHAT_ID" | tr -d '[:space:]')
+                            curl -s -X POST "https://api.telegram.org/bot${c_token}/sendPhoto" \
+                                -F "chat_id=${c_chatid}" \
+                                -F "photo=@/tmp/crimson_shot.png" \
+                                -F "caption=📸 Current Terminal State" > /dev/null 2>&1
+                            rm -f "/tmp/crimson_shot.png"
+                        else
+                            tg_send "❌ Screenshot capture failed." "SYSTEM"
+                        fi
+                    else
+                        tg_send "❌ scrot not installed. Run: sudo apt install scrot" "SYSTEM"
                     fi
                     continue
                 fi

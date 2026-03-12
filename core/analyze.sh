@@ -50,7 +50,7 @@ phase_analyze() {
     
     check_phase_tools "ANALYZE" subjs gf mantra trufflehog arjun || true
     section "PHASE 4: ANALYZE — Secrets & JS Analysis" "🔑"
-    check_proxy
+    check_proxy 2>/dev/null || true
 
     # Ensure standard phase directories exist
     mkdir -p "${TARGET_DIR}/websites" "${TARGET_DIR}/raw" "${TARGET_DIR}/tools_used" "${TARGET_DIR}/loot" 2>/dev/null || true
@@ -59,8 +59,21 @@ phase_analyze() {
     local js_list="${TARGET_DIR}/websites/js_urls.txt"
     local raw="${TARGET_DIR}/tools_used"
     local out_dir="${TARGET_DIR}/websites"
-    local px; px=$(proxy_prefix)
+    local px; px=$(proxy_prefix 2>/dev/null || echo "")
     local ua; ua=$(ua_rand)
+
+    # Create placeholders to prevent 'No such file' read errors
+    touch "${in_crawl}" "${js_list}" "${out_dir}/gf_findings.txt" "${out_dir}/arjun_params.json" "${raw}/mantra.log" 2>/dev/null || true
+
+    # §FIX 3: Seed CRAWL_results from live_urls if CRAWL phase produced nothing
+    if [[ ! -s "${in_crawl}" ]]; then
+        log WARN "No URLs found in CRAWL phase. Seeding ANALYZE from live_urls.txt..."
+        cat "${TARGET_DIR}/websites/live_urls.txt" 2>/dev/null > "${in_crawl}" || true
+    fi
+    if [[ ! -s "${in_crawl}" ]]; then
+        log WARN "live_urls.txt also empty; bootstrapping with TARGET: ${TARGET}"
+        echo "https://${TARGET}" > "${in_crawl}"
+    fi
     
     # Display evasion status
     hud_event "*" "Analysis Phase: Deep Credential Scan + UA Rotation + Rate Limiting ACTIVE"
@@ -71,6 +84,11 @@ phase_analyze() {
             lazy_install_tool "$analyze_tool" || log WARN "Skipping ${analyze_tool} (not available)"
         fi
     done
+
+    # Arjun JIT install (deep recovery for PEP 668 / missing PATH)
+    if ! command -v arjun &>/dev/null; then
+        install_arjun_jit || log SKIP "Arjun still not found; bypassing parameter discovery."
+    fi
 
     # 1. SUBJS (Extract JS from URL corpus) - ENHANCED with UA rotation
     if tool_exists subjs; then
@@ -220,6 +238,7 @@ phase_analyze() {
             printf "${BLINK}${BCR}[⚡] CRITICAL LEAK: ${deep_count} hardcoded credentials found in JS!${RST}\n" >&2
             hud_event "high" "CRITICAL: ${deep_count} hardcoded credentials in JS (RSA: ${rsa_found}, DB: ${db_pass_found})"
             tg_alert "CRITICAL" "🔐 <b>HARDCODED CREDENTIALS IN JS</b>\nTarget: <code>${TARGET}</code>\nRSA Keys: <code>${rsa_found}</code>\nDB Passwords: <code>${db_pass_found}</code>\nTotal: <code>${deep_count}</code>"
+            tg_send "🔐 <b>HARDCODED CREDENTIALS IN JS</b>%0ATarget: <code>${TARGET}</code>%0ARSA Keys: <code>${rsa_found}</code>%0ADB Passwords: <code>${db_pass_found}</code>%0ATotal: <code>${deep_count}</code>" "ALERT"
             cat "$deep_creds" >> "$leaked_secrets"
         fi
     fi
@@ -229,6 +248,7 @@ phase_analyze() {
         local secret_count; secret_count=$(wc -l < "$leaked_secrets")
         hud_event "high" "CRITICAL DATA LEAK DETECTED: ${secret_count} secrets exposed!"
         tg_alert "CRITICAL" "🔓 <b>DATA LEAK DETECTED</b>\nTarget: <code>${TARGET}</code>\nSecrets Found: <code>${secret_count}</code>\nCheck: <code>${leaked_secrets}</code>"
+        tg_send "🔓 <b>DATA LEAK DETECTED</b>%0ATarget: <code>${TARGET}</code>%0ASecrets Found: <code>${secret_count}</code>%0AFile: <code>${leaked_secrets}</code>" "ALERT"
         
         # Trigger high alert pipeline
         if [[ -f "${LIB_PATH}/high_alert.sh" ]] || [[ -f "$(dirname "$0")/../lib/high_alert.sh" ]]; then
@@ -239,33 +259,29 @@ phase_analyze() {
         log OK "No critical secrets detected in analysis phase."
     fi
 
-    # 4. ARJUN (Hidden Parameter Mining)
+    # 4. ARJUN (Hidden Parameter Mining) — §FIX 4: Guard against empty/invalid input
     if command -v arjun &>/dev/null; then
-        log INFO "Arjun — mining hidden parameters (system arjun) ..."
-        CURRENT_TOOL="arjun"
-        job_limiter
-        run_live "arjun -i '${in_crawl}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json'" "${raw}/arjun.log" "ARJUN" &
-        register_batch_pid $!
-    else
-        # Attempt just-in-time installation via official repo (python tool)
-        log WARN "Arjun not found in PATH. Attempting JIT install via git + pip..."
-        mkdir -p "${HOME}/tools" 2>/dev/null || true
-        if [[ ! -d "${HOME}/tools/Arjun" ]]; then
-            git clone https://github.com/s0md3v/Arjun.git "${HOME}/tools/Arjun" 2>/dev/null || true
-        fi
-        if [[ -f "${HOME}/tools/Arjun/requirements.txt" ]]; then
-            pip3 install -r "${HOME}/tools/Arjun/requirements.txt" 2>/dev/null || true
-        fi
-
-        if [[ -f "${HOME}/tools/Arjun/arjun.py" ]]; then
-            log INFO "Running Arjun via python3 ${HOME}/tools/Arjun/arjun.py"
-            CURRENT_TOOL="arjun"
-            job_limiter
-            run_live "python3 '${HOME}/tools/Arjun/arjun.py' -i '${in_crawl}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json'" "${raw}/arjun.log" "ARJUN" &
-            register_batch_pid $!
+        if [[ -s "${in_crawl}" ]]; then
+            local arjun_clean="${out_dir}/arjun_sanitized.txt"
+            sed -E 's/\[|\]//g' "${in_crawl}" | grep -E '^https?://' | sort -u > "${arjun_clean}"
+            
+            local arjun_target_count
+            arjun_target_count=$(wc -l < "${arjun_clean}" 2>/dev/null || echo 0)
+            
+            if [[ "$arjun_target_count" -gt 0 ]]; then
+                log INFO "Arjun — mining hidden parameters on ${arjun_target_count} sanitized targets..."
+                CURRENT_TOOL="arjun"
+                job_limiter
+                run_live "arjun -i '${arjun_clean}' -t ${THREADS} -oJ '${out_dir}/arjun_params.json' --stable" "${raw}/arjun.log" "ARJUN" &
+                register_batch_pid $!
+            else
+                log SKIP "Arjun skipped: No valid sanitized targets found."
+            fi
         else
-            log WARN "Arjun not available after JIT install; skipping parameter mining."
+            log SKIP "Arjun skipped: No input URLs found to mine."
         fi
+    else
+        log SKIP "Arjun not available; skipping parameter discovery."
     fi
 
     monitor_jobs "ANALYZE"
